@@ -873,7 +873,7 @@ const LOGIN_HTML = `<!doctype html>
 <html lang="zh"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <meta name="theme-color" content="#f6821f">
-<title>登录 · Cloudflare 隧道管理</title>
+<title>登录 · Cloudflare 隧道管理面板</title>
 <style>
 *{box-sizing:border-box;-webkit-tap-highlight-color:transparent;margin:0;padding:0}
 body{min-height:100vh;min-height:100dvh;display:flex;align-items:center;justify-content:center;padding:24px;
@@ -957,7 +957,7 @@ const HTML = `<!doctype html>
 <link rel="apple-touch-icon" href="/icon-192.png">
 <meta name="mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-capable" content="yes">
-<title>Cloudflare 隧道管理</title>
+<title>Cloudflare 隧道管理面板</title>
 <style>
 :root{--bg:#f4f5f7;--card:#fff;--text:#1d2129;--sub:#7a828e;--line:#e3e6ea;--brand:#f6821f;--brand2:#ff9d4a;--ok:#22a06b;--bad:#d93f3f;--warn:#e8a317;--code:#16181d;--codet:#d7dae0;--side:#1b1e24;--side2:#2a2f38;--sideText:#c9cfd8;--in:#f4f5f7}
 @media(prefers-color-scheme:dark){:root{--bg:#0f1115;--card:#1a1d23;--text:#e8eaee;--sub:#8b93a0;--line:#2a2e36;--code:#0a0b0e;--codet:#c9ccd3;--side:#15181d;--side2:#262b33;--in:#12151a}}
