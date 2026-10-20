@@ -1,9 +1,11 @@
-// Cloudflare Tunnel 管理面板
+// Cloudflare Worker: Cloudflare Tunnel 管理面板
 // 环境变量 (Settings → Variables and Secrets):
 //   CF_API_TOKEN     API 令牌, 权限: Account → Cloudflare Tunnel → Edit
 //                                   Zone → DNS → Edit, Zone → Zone → Read
 //   CF_ACCOUNT_ID    账户 ID
-//   PASSWORD         登录密码 (必填), 至少 6 位                  
+//   PASSWORD         登录密码 (必填), 至少 6 位
+//   SESSION_SECRET   会话签名密钥 (可选), 推荐设置一串随机字符
+//                    否则自动由 PASSWORD 派生 (改密码后所有人需重新登录)
 //   DEFAULT_SERVICE  本地服务默认地址, 如 http://localhost:8001 (可选)
 //   TG_BOT_TOKEN     Telegram 机器人 Token (可选), 如 123456:ABC...
 //   TG_CHAT_ID       Telegram 接收提醒的 chat_id (可选), 群组为负数
@@ -16,9 +18,33 @@
 // 未绑定 KV 时不会发送提醒。如需定时在后台检查 (即使没人打开面板), 可在
 // Triggers → Cron 中添加 *\/5 * * * * , 并在 Worker 入口加一个 scheduled 处理 (见代码末尾注释)。
 
+// ============================ 配置填写区 ============================
+// 推荐用 Dashboard → Settings → Secrets 配置。
+// 注意: KV 命名空间 TUNNEL_STATE 是运行时绑定,需在 Dashboard → Settings → Bindings → KV Namespace 绑定。
+const CONFIG_DEFAULTS = {
+  CF_API_TOKEN:    "", // [必填] API 令牌: Account→Cloudflare Tunnel→Edit; Zone→DNS→Edit; Zone→Zone→Read
+  CF_ACCOUNT_ID:   "", // [必填] Cloudflare 账户 ID, Workers 页面右侧可查
+  PASSWORD:        "", // [必填] 面板登录密码, 至少 6 位
+  SESSION_SECRET:  "", // [可选] 会话签名密钥, 填一串随机字符; 留空则自动由 PASSWORD 派生
+  DEFAULT_SERVICE: "", // [可选] 新建/编辑隧道的默认本地服务地址, 默认 http://localhost:8001
+  TG_BOT_TOKEN:    "", // [可选] Telegram 机器人 Token; 也可在面板"Telegram 配置"里保存到 KV
+  TG_CHAT_ID:      "", // [可选] Telegram 接收者 chat_id: 私聊填自己的正数 ID, 群组填负数
+};
+// ====================================================================
+
+// 参数处理
+function applyConfig(env) {
+  const out = Object.assign({}, env);
+  for (const k of Object.keys(CONFIG_DEFAULTS)) {
+    const v = String(CONFIG_DEFAULTS[k] || "").trim();
+    if (v) out[k] = v;
+  }
+  return out;
+}
+// 全局api
 const API = "https://api.cloudflare.com/client/v4";
 
-// 把 Cloudflare 返回的英文错误翻译成中文 (未收录的保留原文并附错误码)
+// 辅助函数
 const ZH_ERRORS = [
   [/already have a tunnel with this name/i, "已存在同名隧道,请删除原隧道或换一个名称"],
   [/authentication error|valid user-level authentication|invalid api token|unauthorized/i,
@@ -470,7 +496,8 @@ async function readState(env, key) {
 async function runChecks(env, list) {
   const kv = env.TUNNEL_STATE;
   const now = Date.now();
-  const tunnels = list.map((t) => ({ id: t.id, name: t.name, status: t.status, up: isUp(t) }));
+  // conns_active_at: 隧道建立首条到 Cloudflare 边缘连接的时间 (官方"运行时间"同源), 空=从未连接
+  const tunnels = list.map((t) => ({ id: t.id, name: t.name, status: t.status, up: isUp(t), since: Date.parse(t.conns_active_at || "") || 0 }));
   const result = {
     tunnels,
     total: tunnels.length,
@@ -651,7 +678,7 @@ async function handleApi(request, env, path) {
   const acc = env.CF_ACCOUNT_ID;
   const base = `/accounts/${acc}/cfd_tunnel`;
 
-  if (["/api/token", "/api/detail", "/api/update", "/api/delete", "/api/alert", "/api/route"].includes(path) && !uuid(d.id))
+  if (["/api/token", "/api/detail", "/api/update", "/api/delete", "/api/alert", "/api/route", "/api/uptime"].includes(path) && !uuid(d.id))
     return json({ error: "隧道 ID 无效" }, 400);
 
   const svcErr = (s) =>
@@ -697,6 +724,17 @@ async function handleApi(request, env, path) {
   }
 
   if (path === "/api/token") return json({ token: await cf(env, `${base}/${d.id}/token`) });
+
+  // 单隧道连接器运行时长: 取各连接器 run_at (连接建立时间) 的最早一条; 列表徽章无需调此接口
+  if (path === "/api/uptime") {
+    const conns = await cf(env, `${base}/${d.id}/connections`).catch(() => []);
+    let since = 0;
+    for (const c of Array.isArray(conns) ? conns : []) {
+      const ts = Date.parse(c.run_at || c.create_time || c.CreateTime || "");
+      if (ts && (!since || ts < since)) since = ts;
+    }
+    return json({ since, ms: since ? Date.now() - since : 0 });
+  }
 
   // 新增/删除路由: 在已有隧道上追加一条 ingress 规则 (域名 + 可选路径 + 服务), 并自动配置 DNS
   if (path === "/api/route") {
@@ -768,7 +806,19 @@ async function handleApi(request, env, path) {
       path: rule.path || "",
       service: rule.service || "",
       others: ingress.filter((r) => r.hostname && r !== rule).length,
-      rules: ingress.filter((r) => r.hostname).map((r) => ({ hostname: r.hostname, path: r.path || "", service: r.service || "" })),
+      // zoneId/sub 逐条给出, 供前端编辑弹窗按所选路由回填域名下拉与子域名
+      rules: ingress
+        .filter((r) => r.hostname)
+        .map((rule) => {
+          const z = zoneForHost(zones, rule.hostname);
+          return {
+            hostname: rule.hostname,
+            path: rule.path || "",
+            service: rule.service || "",
+            zoneId: z ? z.id : "",
+            sub: z && rule.hostname !== z.name ? rule.hostname.slice(0, -(z.name.length + 1)) : "",
+          };
+        }),
     });
   }
 
@@ -782,8 +832,16 @@ async function handleApi(request, env, path) {
     const hostname = sub ? `${sub}.${zone.name}` : zone.name;
 
     const { config, ingress } = await getRules(env, base, d.id);
-    const idx = ingress.findIndex((r) => r.hostname);
-    const oldHost = idx >= 0 ? ingress[idx].hostname : "";
+    // 多条路由时: 前端带"原域名(host)+原路径(oldPath)"定位要编辑的规则; 未带则回退旧行为编辑第一条
+    const oldHost = str(d.host);
+    const oldPath = str(d.oldPath);
+    let idx;
+    if (oldHost) {
+      idx = ingress.findIndex((r) => r.hostname === oldHost && (r.path || "") === oldPath);
+      if (idx < 0) return json({ error: "要编辑的路由已不存在, 请刷新列表后重试" }, 400);
+    } else {
+      idx = ingress.findIndex((r) => r.hostname);
+    }
     const rule = idx >= 0 ? { ...ingress[idx] } : {};
     rule.hostname = hostname;
     rule.service = service;
@@ -839,6 +897,7 @@ async function handleApi(request, env, path) {
 
 export default {
   async fetch(request, env) {
+    env = applyConfig(env); // 顶部"配置填写区"优先
     if (!env.PASSWORD) return new Response("请先配置环境变量 PASSWORD", { status: 500 });
     if (String(env.PASSWORD).length < 6) return new Response("PASSWORD 至少 6 位", { status: 500 });
 
@@ -904,6 +963,7 @@ box-shadow:0 8px 24px rgba(246,130,31,.32);transition:transform .12s,box-shadow 
 button:hover{box-shadow:0 10px 30px rgba(246,130,31,.45)}
 button:active{transform:scale(.98)}
 button:disabled{opacity:.6;pointer-events:none}
+button.oks{opacity:1;background:linear-gradient(135deg,#17a35f,#2ecc7d);box-shadow:0 8px 24px rgba(34,160,107,.35)}
 .err{display:flex;align-items:center;justify-content:center;gap:6px;min-height:20px;margin-top:14px;color:#e05252;font-size:13px}
 .foot{margin-top:22px;font-size:11.5px;display:flex;align-items:center;justify-content:center}
 .foot a{color:#5b6270;text-decoration:none;display:inline-flex;align-items:center;gap:6px;transition:color .15s}
@@ -919,7 +979,7 @@ button:disabled{opacity:.6;pointer-events:none}
 <div class="wrap">
   <form class="card" id="f" novalidate>
     <div class="logo">${CF_LOGO}</div>
-    <h1>Cloudflare 隧道管理</h1>
+    <h1>Cloudflare 隧道管理面板</h1>
     <p class="sub">Tunnel 管理与 Telegram 上下线提醒</p>
     <div class="field">
       <span class="li">🔒</span>
@@ -940,7 +1000,7 @@ f.addEventListener('submit',async function(e){
     var r=await fetch('/api/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password:pw.value})});
     var d=await r.json().catch(function(){return {}});
     if(!r.ok)throw new Error(d.error||'登录失败');
-    go.textContent='✓ 登录成功';
+    go.textContent='✓ 登录成功';go.classList.add('oks');
     location.replace('/');
   }catch(ex){
     err.textContent='⚠ '+(ex.message||'登录失败');go.disabled=false;go.textContent='登 录';pw.select();
@@ -964,7 +1024,7 @@ const HTML = `<!doctype html>
 *{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
 body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;background:var(--bg);color:var(--text);font-size:14px}
 .app{display:flex;height:100vh;height:100dvh;overflow:hidden}
-.sidenav{width:216px;flex:none;background:var(--side);color:var(--sideText);display:flex;flex-direction:column;padding:calc(env(safe-area-inset-top,0px) + 18px) 12px calc(env(safe-area-inset-bottom,0px) + 14px)}
+.sidenav{width:180px;flex:none;background:var(--side);color:var(--sideText);display:flex;flex-direction:column;padding:calc(env(safe-area-inset-top,0px) + 18px) 12px calc(env(safe-area-inset-bottom,0px) + 14px)}
 .sidenav .brand{display:flex;align-items:center;gap:9px;padding:2px 8px 18px;color:#fff;font-weight:700;font-size:15px}
 .sidenav .brand .ic{width:30px;height:30px;border-radius:9px;background:linear-gradient(135deg,var(--brand),var(--brand2));display:flex;align-items:center;justify-content:center;font-size:16px}
 .nav{display:flex;flex-direction:column;gap:4px}
@@ -1012,13 +1072,13 @@ background:var(--side2);color:var(--sub);font-size:12px;line-height:1;cursor:poi
 .code{margin-top:0;position:relative}
 .code pre{margin:0;padding:12px;background:var(--code);color:var(--codet);border-radius:10px;font-size:12.5px;line-height:1.5;white-space:pre-wrap;word-break:break-all;max-height:150px;overflow:auto;font-family:ui-monospace,SFMono-Regular,Consolas,monospace;cursor:pointer;transition:box-shadow .15s}
 .code pre:hover{box-shadow:0 0 0 1px var(--brand)}
-.code .hintcp{position:absolute;top:8px;right:10px;display:inline-flex;align-items:center;gap:5px;padding:3px 9px;border-radius:7px;background:var(--side2);color:var(--text);font-size:12px;opacity:0;pointer-events:none;transition:opacity .15s;z-index:2}
+.code .hintcp{position:absolute;bottom:8px;right:10px;display:inline-flex;align-items:center;gap:5px;padding:3px 9px;border-radius:7px;background:rgba(8,12,10,.92);color:#2ecc7d;border:1px solid rgba(255,255,255,.18);font-size:12px;opacity:0;pointer-events:none;transition:opacity .15s;z-index:2}
 .code:hover .hintcp{opacity:1}
 .tit{font-size:12px;color:var(--sub);margin:14px 0 6px;display:flex;justify-content:space-between;align-items:center}
 .banner{display:flex;gap:12px;align-items:center;padding:12px 14px;border-radius:12px;margin-bottom:14px;font-size:14px;line-height:1.5;background:rgba(34,160,107,.12);color:var(--ok)}
 .banner .ck{width:26px;height:26px;flex:none;border-radius:50%;background:var(--ok);color:#fff;display:flex;align-items:center;justify-content:center;font-size:15px}
 .banner .bd{flex:1;min-width:0}
-.item{border-top:1px solid var(--line);padding:8px 0}
+.item{border-top:1px solid var(--line);padding:8px 0;position:relative}
 .item:first-child{border-top:0}
 .item .top{display:flex;align-items:center;gap:8px}
 .item .nm{font-weight:600;flex:1;min-width:0;word-break:break-all}
@@ -1030,19 +1090,22 @@ background:var(--side2);color:var(--sub);font-size:12px;line-height:1;cursor:poi
 .badge.down{background:rgba(217,63,63,.13);color:var(--bad)}
 .id{font-size:11px;color:var(--sub);margin:2px 0 0;word-break:break-all}
 /* 紧凑行: 第一行 名称+域名+状态徽标, 第二行 路由+操作按钮全部一排 */
-.trow{display:flex;align-items:center;gap:10px;flex-wrap:wrap;position:relative}
+/* trow 不再是定位上下文: 按钮组/状态徽章改以 .item(整行) 为基准垂直居中 */
+.trow{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
 .trow .nm{font-weight:600;flex:none;max-width:280px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .trow .id{margin:0;flex:none;font-size:11px;color:var(--sub);word-break:break-all}
 .trow .host{flex:1;min-width:120px;font-size:12.5px;color:var(--sub);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .trow .host b{color:var(--text);font-weight:600}
 .trow .host .rp{color:var(--warn)}
-.routes{margin:2px 0 0;font-size:12.5px;color:var(--sub);line-height:1.6}
+.routes{margin:2px 18px 0;font-size:12.5px;color:var(--sub);line-height:1.6}
 .routes b{color:var(--text);font-weight:600}
 .routes .rp{color:var(--warn)}
 .acts{display:flex;gap:6px;flex-wrap:wrap;align-items:center;justify-content:flex-end;flex:1;min-width:280px;margin-right:106px}
 .acts .btn.sm{padding:4px 10px;font-size:12px;border-radius:8px}
 .acts .btn.sm .btxt{display:none}
-@media(min-width:900px){.acts .btn.sm .btxt{display:inline}.acts .btn.sm .bico{margin-right:2px}}
+/* 宽屏: 按钮组脱离文本流, 相对整条 item(名称行+路由行)垂直居中; 右侧留出徽章位置 */
+@media(min-width:900px){.acts .btn.sm .btxt{display:inline}.acts .btn.sm .bico{margin-right:2px}
+  .trow .acts{position:absolute;top:50%;transform:translateY(-50%);right:106px;margin:0;flex:none}}
 /* 路由表格 (编辑/路由弹窗) */
 .rtable{margin-top:8px}
 .rtable .rt{display:flex;align-items:center;gap:8px;padding:7px 10px;border-radius:9px;background:var(--in);margin-bottom:6px;font-size:13px}
@@ -1074,8 +1137,8 @@ background:var(--side2);color:var(--sub);font-size:12px;line-height:1;cursor:poi
 .busy .box{background:var(--card);color:var(--text);padding:18px 26px;border-radius:14px;display:flex;align-items:center;gap:12px;font-size:15px}
 .busy .spin{width:20px;height:20px;border:3px solid var(--line);border-top-color:var(--brand)}
 #toast{position:fixed;left:50%;top:calc(env(safe-area-inset-top,0px) + 14px);transform:translate(-50%,-160%);z-index:30;max-width:min(680px,92vw);display:flex;align-items:center;gap:7px;padding:8px 14px;border-radius:10px;font-size:14px;font-weight:600;line-height:1.45;opacity:0;pointer-events:none;transition:transform .24s ease,opacity .24s ease}
-#toast.ok{color:#22a06b}
-#toast.err{color:#e05252}
+#toast.ok{color:#22a06b;background:var(--card);background:color-mix(in srgb,#22a06b 16%,var(--card));border:1px solid rgba(34,160,107,.45);box-shadow:0 10px 28px rgba(0,0,0,.16)}
+#toast.err{color:#e05252;background:var(--card);background:color-mix(in srgb,#e05252 16%,var(--card));border:1px solid rgba(224,82,82,.45);box-shadow:0 10px 28px rgba(0,0,0,.16)}
 #toast.show{opacity:1;transform:translate(-50%,0)}
 #toast .ti{font-size:15px;font-weight:700;flex:none;line-height:1}
 .chat{display:flex;align-items:center;gap:10px;padding:10px 0;border-top:1px solid var(--line)}
@@ -1102,7 +1165,7 @@ background:var(--side2);color:var(--sub);font-size:12px;line-height:1;cursor:poi
     <div class="brand"><span class="ic">☁️</span><span>隧道管理</span></div>
     <nav class="nav">
       <a data-v="dash" class="on"><span class="i">📊</span>仪表板</a>
-      <a data-v="tunnels"><span class="i">🔌</span>Tunnel 管理</a>
+      <a data-v="tunnels"><span class="i">⚙️</span>Tunnel 管理</a>
       <a data-v="tg"><span class="i">✈️</span>Telegram 配置</a>
     </nav>
     <div class="foot"><a href="#" id="logout">退出登录</a></div>
@@ -1190,20 +1253,20 @@ background:var(--side2);color:var(--sub);font-size:12px;line-height:1;cursor:poi
 
 <div class="modal" id="mCreate">
   <h3><span>新建隧道</span><button class="x" id="m_x">✕</button></h3>
-  <div class="hint">填写后点"一键创建", 创建完成会立即显示 Token。</div>
+  <div class="hint">填写后点"创建隧道", 创建完成会立即显示 Token</div>
   <label>隧道名称</label>
-  <input id="name" placeholder="例如 my-tunnel" autocomplete="off">
+  <input id="name" placeholder="建议填写平台的名称, 例如：aws-jp" autocomplete="off">
   <label>公开域名</label>
   <div class="row">
-    <input id="sub" class="sub" placeholder="子域名(可空)" autocapitalize="off" autocomplete="off">
+    <input id="sub" class="sub" placeholder="子域名(留空将使用主域名)" autocapitalize="off" autocomplete="off">
     <select id="zone" class="zone"><option>加载中...</option></select>
   </div>
   <label>路径(可选)</label>
   <input id="path" placeholder="例如 /api 或 ^/ws,留空匹配全部" autocapitalize="off" autocomplete="off">
-  <label>本地服务地址</label>
+  <label>本地服务地址( tcp://localhost:3389  http://localhost:8080 )</label>
   <input id="svc" placeholder="http://localhost:8001" autocapitalize="off" autocomplete="off">
   <div class="preview" id="pv"></div>
-  <div class="btns"><button class="btn gray" id="m_cancel">取消</button><button class="btn" id="go">🚀 一键创建</button></div>
+  <div class="btns"><button class="btn gray" id="m_cancel">取消</button><button class="btn" id="go">创建隧道</button></div>
 </div>
 
 <div class="modal" id="mToken">
@@ -1217,6 +1280,10 @@ background:var(--side2);color:var(--sub);font-size:12px;line-height:1;cursor:poi
   <div id="e_note" class="hint"></div>
   <label>隧道名称</label>
   <input id="e_name" autocomplete="off">
+  <div id="e_pick_wrap" style="display:none">
+    <label>正在编辑的路由</label>
+    <select id="e_pick"></select>
+  </div>
   <label>公开域名</label>
   <div class="row">
     <input id="e_sub" class="sub" placeholder="子域名(可空)" autocapitalize="off" autocomplete="off">
@@ -1224,7 +1291,7 @@ background:var(--side2);color:var(--sub);font-size:12px;line-height:1;cursor:poi
   </div>
   <label>路径(可选)</label>
   <input id="e_path" placeholder="例如 /api 或 ^/ws,留空匹配全部" autocapitalize="off" autocomplete="off">
-  <label>本地服务地址</label>
+  <label>本地服务地址( tcp://localhost:3389  http://localhost:8080 )</label>
   <input id="e_svc" placeholder="http://localhost:8001" autocapitalize="off" autocomplete="off">
   <div class="preview" id="e_pv"></div>
   <div class="btns"><button class="btn gray" id="e_cancel">取消</button><button class="btn" id="e_save">保存</button></div>
@@ -1250,7 +1317,7 @@ background:var(--side2);color:var(--sub);font-size:12px;line-height:1;cursor:poi
     </div>
     <label>路径(可选)</label>
     <input id="r_path" placeholder="留空匹配全部" autocapitalize="off" autocomplete="off">
-    <label>本地服务地址</label>
+    <label>本地服务地址( tcp://localhost:3389  http://localhost:8080 )</label>
     <input id="r_svc" placeholder="http://localhost:8001" autocapitalize="off" autocomplete="off">
     <div class="preview" id="r_pv"></div>
     <div class="btns"><button class="btn gray" id="r_cancel">关闭</button><button class="btn" id="r_add">＋ 添加路由</button></div>
@@ -1366,6 +1433,14 @@ document.querySelectorAll('.view').forEach(function(s){s.addEventListener('click
 
 /* ---- 仪表板 ---- */
 var stText={healthy:'在线',degraded:'降级',down:'离线',inactive:'未启用'};
+function durShort(ms){
+  var m=Math.floor(ms/60000);
+  if(m<1)return '<1m';
+  if(m<60)return m+'m';
+  var h=Math.floor(m/60);
+  if(h<24)return h+'h';
+  return Math.floor(h/24)+'d';
+}
 function renderDash(d){
   $('s_on').textContent=d.online;$('s_off').textContent=d.offline;$('s_all').textContent=d.total;
   var pill=$('alert_state');
@@ -1383,7 +1458,7 @@ function renderDash(d){
 }
 
 /* ---- 隧道列表 + 搜索 ---- */
-var allTunnels=[],allAlertOn={},metaCache={};
+var allTunnels=[],allAlertOn={},metaCache={},upTs={};
 function setSum(d){
   $('sum').innerHTML='共 <b>'+d.total+'</b> · 在线 <b>'+d.online+'</b> · 离线 <b>'+d.offline+'</b>';
 }
@@ -1401,6 +1476,9 @@ function renderList(){
   if(!arr.length){l.innerHTML='<div class="empty">没有匹配的隧道</div>';return}
   l.innerHTML=arr.map(function(t){
     var on=allAlertOn[t.id]===true,m=metaCache[t.id]||{};
+    // 在线徽章附带运行时长 (随 /api/list 的 conns_active_at 下发, 实时计算)
+    var badgeTxt=stText[t.status]||t.status;
+    if(t.status==='healthy'&&upTs[t.id])badgeTxt+=' '+durShort(Date.now()-upTs[t.id]);
     var rules=(m.routes&&m.routes.length?m.routes:(m.hostname?[{hostname:m.hostname,path:m.path||'',service:m.service||''}]:[]));
     // routes===null 表示还没拉到或拉取失败, 显示"加载中"而不是误导性的"未配置域名"
     var routeLines=(m.routes===null&&(!rules||!rules.length))
@@ -1422,7 +1500,7 @@ function renderList(){
       '<button class="btn sm" data-act="alert" data-id="'+esc(t.id)+'" data-up="'+(t.up?1:0)+'" data-on="'+(on?1:0)+'">'+(on?'🔔':'🔕')+'<span class="btxt">'+(on?'提醒开':'提醒关')+'</span></button>'+
       '<button class="btn sm red" data-act="del" data-id="'+esc(t.id)+'"><span class="bico">🗑</span><span class="btxt">删除</span></button>'+
       '</div>'+
-      '<span class="badge '+esc(t.status)+'" style="position:absolute;right:0;top:50%;transform:translateY(-50%)">'+esc(stText[t.status]||t.status)+'</span>'+
+      '<span class="badge '+esc(t.status)+'" style="position:absolute;right:0;top:50%;transform:translateY(-50%)" title="'+(upTs[t.id]?'自 '+new Date(upTs[t.id]).toLocaleString():'')+'">'+esc(badgeTxt)+'</span>'+
       '</div>'+
       '<div class="routes">'+routeLines+'</div></div>';
   }).join('');
@@ -1434,11 +1512,13 @@ $('q').addEventListener('input',function(){
 $('qclear').onclick=function(){
   $('q').value='';$('q').parentNode.className='search';renderList();$('q').focus();
 };
+$('refresh').onclick=function(){loadList().then(loadMeta)};
 async function loadList(){
   var l=$('list');
   try{
     var d=await api('/api/list');
     allTunnels=d.tunnels||[];allAlertOn=d.alertOn||{};
+    upTs={};(d.tunnels||[]).forEach(function(t){if(t.since)upTs[t.id]=t.since});
     setSum(d);renderDash(d);renderList();
   }catch(e){$('sum').innerHTML='';l.innerHTML='<div class="empty">加载失败</div>';fail(e)}
 }
@@ -1529,19 +1609,24 @@ $('go').onclick=async function(){
     loadList().then(loadMeta);
     showToken({name:d.name,id:d.id,hostname:d.hostname,path:d.path||'',service:d.service},d.token,true);
   }catch(e){fail(e)}
-  b.disabled=false;b.innerHTML='🚀 一键创建';
+  b.disabled=false;b.innerHTML='创建隧道';
 };
 
 /* ---- Token 弹窗 ---- */
 $('t_x').onclick=closeModal;
 function showToken(r,token,fresh){
   $('t_banner').innerHTML='<div class="banner"><span class="ck">✓</span><div class="bd">'+
-    (fresh?'隧道创建成功, 复制下面的 Token 到服务器运行 cloudflared:':'隧道: <b>'+esc(r.name||r.id)+'</b>')+
+    (fresh?'隧道创建成功, 复制下面的域名和Token到服务器运行cloudflared':'隧道: <b>'+esc(r.name||r.id)+'</b>')+
     '</div></div>'+
-    (r.hostname
-      ?'<div class="tit" style="margin-top:2px"><span>域名</span></div>'+
-       '<div class="code"><span class="hintcp">⧉ 点击复制</span><pre style="max-height:none" data-copy="'+esc(r.hostname)+'">'+esc(r.hostname)+'</pre></div>'
-      :'');
+    // 多路由隧道: 逐条列出全部域名, 每条可单独点击复制 (路径只显示不复制)
+    (function(){
+      var rules=(r.rules&&r.rules.length?r.rules:(r.hostname?[{hostname:r.hostname,path:r.path||''}]:[]));
+      if(!rules.length)return '';
+      return '<div class="tit" style="margin-top:2px"><span>域名'+(rules.length>1?' ('+rules.length+' 条)':'')+'</span></div>'+
+        rules.map(function(x){
+          return '<div class="code"><span class="hintcp">⧉ 点击复制</span><pre style="max-height:none" data-copy="'+esc(x.hostname)+'">'+esc(x.hostname)+(x.path?'<span style="color:#8b93a0"> · '+esc(x.path)+'</span>':'')+'</pre></div>';
+        }).join('<div style="height:8px"></div>');
+    })();
   $('t_body').innerHTML=cmds(token);
   openModal('mToken');
 }
@@ -1552,13 +1637,13 @@ async function showTk(id,name){
   try{
     var res=await Promise.all([api('/api/token',{id:id}),api('/api/detail',{id:id}).catch(function(){return null})]);
     var det=res[1]||{};
-    var rules=(det.rules||[])[0]||{};
-    showToken({name:name,id:id,hostname:rules.hostname||'',path:rules.path||'',service:det.service||''},res[0].token,false);
+    var rules=det.rules||[];
+    showToken({name:name,id:id,rules:rules,hostname:rules[0]?rules[0].hostname:'',path:rules[0]?(rules[0].path||''):'',service:det.service||''},res[0].token,false);
   }catch(e){$('t_body').innerHTML='<div class="empty">加载失败</div>';fail(e)}
 }
 async function del(id){
   if(!(await askConfirm('确定删除该隧道?\\n将同时删除对应的 DNS 记录。','删除隧道','删除')))return;
-  setBusy(true,'正在删除隧道和DNS,请稍等...');
+  setBusy(true,'删除tunnel和dns中...');
   try{
     var d=await api('/api/delete',{id:id});
     toast(d.dnsFailed?'隧道已删除, 但 DNS 记录清理失败, 请到 DNS 页面手动删除':(d.dns?'已删除隧道和 '+d.dns+' 条 DNS 记录':'已删除隧道'));
@@ -1568,7 +1653,13 @@ async function del(id){
 }
 
 /* ---- 编辑 ---- */
-var editId=null,editOld='';
+var editId=null,editOld='',editRules=[],editSel=0;
+function fillEditRule(i){
+  editSel=i;var r=editRules[i];if(!r)return;
+  if(r.zoneId)$('e_zone').value=r.zoneId;
+  $('e_sub').value=r.sub||'';$('e_path').value=r.path||'';$('e_svc').value=r.service||'';
+  ePreview();
+}
 function ePreview(){
   var sub=$('e_sub').value.trim().replace(/\.$/,''),o=$('e_zone').options[$('e_zone').selectedIndex],
       z=o?o.textContent.charAt(0)==='.'?o.textContent.slice(1):'':'',p=$('e_path').value.trim(),s=$('e_svc').value.trim();
@@ -1576,18 +1667,31 @@ function ePreview(){
   $('e_pv').innerHTML='<b>'+esc(sub?sub+'.'+z:z)+'</b>'+(p?' · 路径 '+esc(p):'')+' → '+esc(s||'(未填写本地服务)');
 }
 async function openEdit(id,name){
-  editId=id;editOld=name;
+  editId=id;editOld=name;editRules=[];editSel=0;
   $('e_name').value=name;$('e_sub').value='';$('e_path').value='';$('e_svc').value='';
+  $('e_pick').innerHTML='';$('e_pick_wrap').style.display='none';
   $('e_note').innerHTML='读取配置中...';
   $('e_zone').innerHTML=$('zone').innerHTML;
   $('e_save').disabled=true;
   openModal('mEdit');
   try{
     var d=await api('/api/detail',{id:id});
-    $('e_sub').value=d.sub;$('e_path').value=d.path;$('e_svc').value=d.service;
-    if(d.zoneId)$('e_zone').value=d.zoneId;
-    var note=d.hostname?'':'该隧道还没有公开域名规则, 保存后将新建。';
-    if(d.others)note+=' 另有 '+d.others+' 条其他域名规则, 保存时保持不变。';
+    editRules=d.rules||[];
+    var note='';
+    if(editRules.length>1){
+      // 多条路由: 显示选择器, 表单随选择切换; 单条/无路由保持原表单不变
+      $('e_pick').innerHTML=editRules.map(function(r,i){
+        return '<option value="'+i+'">'+esc(r.hostname+(r.path?' · '+r.path:''))+(r.service?' → '+esc(r.service):'')+'</option>';
+      }).join('');
+      $('e_pick_wrap').style.display='';
+      fillEditRule(0);
+      note='该隧道共有 '+editRules.length+' 条路由, 在"正在编辑的路由"中选择要修改的一条; 保存时其他规则保持不变。';
+    }else{
+      $('e_sub').value=d.sub;$('e_path').value=d.path;$('e_svc').value=d.service;
+      if(d.zoneId)$('e_zone').value=d.zoneId;
+      note=d.hostname?'':'该隧道还没有公开域名规则, 保存后将新建。';
+      if(d.others)note+=' 另有 '+d.others+' 条其他域名规则, 保存时保持不变。';
+    }
     $('e_note').innerHTML=esc(note);
     $('e_save').disabled=false;ePreview();
   }catch(e){$('e_note').innerHTML='';fail(e)}
@@ -1599,8 +1703,10 @@ async function saveEdit(){
   if(!$('e_svc').value.trim()){toast('请填写本地服务地址','err');return}
   b.disabled=true;b.innerHTML='<span class="spin"></span> 保存中';
   try{
+    var sel=editRules.length>1?editRules[$('e_pick').selectedIndex]:editRules[0];
     var d=await api('/api/update',{id:editId,name:name!==editOld?name:'',zoneId:$('e_zone').value,
-      sub:$('e_sub').value.trim(),path:$('e_path').value.trim(),service:$('e_svc').value.trim()});
+      sub:$('e_sub').value.trim(),path:$('e_path').value.trim(),service:$('e_svc').value.trim(),
+      host:sel&&sel.hostname||'',oldPath:sel&&sel.path||''});
     closeModal();
     toast(d.dnsFailed?'已保存, 但旧 DNS 记录清理失败, 请手动删除':'修改已保存');
     loadList().then(loadMeta);
@@ -1608,6 +1714,7 @@ async function saveEdit(){
   b.disabled=false;b.innerHTML='保存';
 }
 ['e_sub','e_zone','e_path','e_svc'].forEach(function(i){$(i).addEventListener('input',ePreview);$(i).addEventListener('change',ePreview)});
+$('e_pick').addEventListener('change',function(){fillEditRule(+this.value)});
 $('e_x').onclick=closeModal;$('e_cancel').onclick=closeModal;$('e_save').onclick=saveEdit;
 
 /* ---- 路由管理 ---- */
@@ -1746,6 +1853,7 @@ if('serviceWorker' in navigator)navigator.serviceWorker.register('/sw.js',{scope
 
 // 定时检查 (可选): Worker → Triggers → Cron 添加 */5 * * * * 即可在后台持续检查并提醒。
 export const scheduled = async (event, env, ctx) => {
+  env = applyConfig(env); // 顶部"配置填写区"优先
   if (!env.CF_API_TOKEN || !env.CF_ACCOUNT_ID || !env.TUNNEL_STATE) return;
   try {
     await runChecks(env, await listTunnels(env, `/accounts/${env.CF_ACCOUNT_ID}/cfd_tunnel`));
