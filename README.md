@@ -13,12 +13,12 @@
 - **Telegram 上下线提醒**：状态**发生变化**才推送（上线一次、离线一次），可按隧道逐个开关（**默认关闭**）；支持多个接收者（私聊/群组/频道）、暂停/恢复推送。
 - **PWA**：可安装到桌面/手机主屏，带离线壳页面。
 
-## 快速部署（Cloudflare Dashboard）
+## 快速部署
 
 1. 登录 [Cloudflare Dashboard](https://dash.cloudflare.com) → **Workers & Pages** → **Create** → 创建 Worker，把 `_worker.js` 内容全部粘贴进去，保存。
 2. **【非必须】绑定 KV 命名空间**：Worker → Settings → Bindings → Add → KV Namespace，变量名填 `TUNNEL_STATE`（没有它无法保存提醒配置、接收者等信息）。
-3. **【必须】配置环境变量**：Settings → Variables and Secrets，添加 `CF_API_TOKEN`、`CF_ACCOUNT_ID`、`PASSWORD`（详见下表）。
-4. 部署后打开 `https://<Worker 域名>/`，输入密码登录即可。
+3. **【必须】配置环境变量**：Settings → Variables and Secrets，添加 `CF_API_TOKEN`、`CF_ACCOUNT_ID`、`PASSWORD` 其他变量非必须（详见下表）。
+4. 部署后打开 `https://<Worker 域名>`，输入密码登录即可。
 
 ## 环境变量
 
@@ -33,7 +33,7 @@
 | `TG_BOT_TOKEN` | 可选 | Telegram 机器人 Token（环境变量兜底；也可在面板里保存到 KV） |
 | `TG_CHAT_ID` | 可选 | 默认接收者 chat_id（环境变量兜底） |
 
-## Telegram 提醒配置
+## Telegram 提醒配置(可选)
 
 1. 在 Telegram 找 [@BotFather](https://t.me/BotFather)，`/newbot` 创建机器人，拿到 **Bot Token**。
 2. **想让谁收提醒，就让谁先给机器人发一条消息（或 `/start`）**——机器人无法主动私聊从未互动过的用户。
@@ -71,7 +71,7 @@
 
 ## 常见问题
 
-- **"未绑定 KV 命名空间 TUNNEL_STATE"**：在 Worker → Settings → Bindings 里绑定 KV，变量名必须为 `TUNNEL_STATE`。
+- **"KV 命名空间 TUNNEL_STATE"**：在 Worker → Settings → Bindings 里绑定 KV，变量名必须为 `TUNNEL_STATE`。
 - **"找不到该 chat_id"**：私聊接收者没给机器人发过 `/start`；或把机器人 ID/正数当成了群 ID 填写。个人填正数用户 ID，群组填负数 ID。
 - **"机器人 Token 无效"**：检查 Bot Token 是否复制完整、机器人是否被 BotFather 停用。
 - **"隧道仍有活跃连接,请先停止 cloudflared"**：删除前需先在目标机器上停止 `cloudflared` 进程（Cloudflare 平台限制）。
