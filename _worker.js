@@ -16,10 +16,10 @@
 // 首次记录不发提醒。比较的结果保存在 KV 中, 需要绑定 KV 命名空间:
 //   变量名 TUNNEL_STATE (Settings → Bindings → KV Namespace)
 // 未绑定 KV 时不会发送提醒。如需定时在后台检查 (即使没人打开面板), 可在
-// Triggers → Cron 中添加 *\/5 * * * * , 并在 Worker 入口加一个 scheduled 处理 (见代码末尾注释)。
+// Triggers → Cron 中添加 * /5 * * * * , 并在 Worker 入口加一个 scheduled 处理 。
 
 // ============================ 配置填写区 ============================
-// 推荐用 Dashboard → Settings → Secrets 配置。
+// 推荐用 Dashboard → Settings → Secrets 配置环境变量。
 // 注意: KV 命名空间 TUNNEL_STATE 是运行时绑定,需在 Dashboard → Settings → Bindings → KV Namespace 绑定。
 const CONFIG_DEFAULTS = {
   CF_API_TOKEN:    "", // [必填] API 令牌: Account→Cloudflare Tunnel→Edit; Zone→DNS→Edit; Zone→Zone→Read
