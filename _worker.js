@@ -12,14 +12,14 @@
 //
 // 访问方式: 打开 https://你的域名/ , 输入 PASSWORD 登录后进入管理面板。
 //
-// 提醒逻辑: 每次打开列表时比对隧道在线状态, 与上次相比发生变化才提醒 (上/下线各一次),
+// 提醒逻辑: 每次打开列表时比对隧道在线状态, 与上次相比发生变化才提醒 (上/下线各一次)
 // 首次记录不发提醒。比较的结果保存在 KV 中, 需要绑定 KV 命名空间:
 //   变量名 TUNNEL_STATE (Settings → Bindings → KV Namespace)
 // 未绑定 KV 时不会发送提醒。如需定时在后台检查 (即使没人打开面板), 可在
-// Triggers → Cron 中添加 * /5 * * * * , 并在 Worker 入口加一个 scheduled 处理 。
+// Triggers → Cron 中添加 *\/5 * * * * , 并在 Worker 入口加一个 scheduled 处理 (见代码末尾注释)。
 
 // ============================ 配置填写区 ============================
-// 推荐用 Dashboard → Settings → Secrets 配置环境变量。
+// 推荐用 Dashboard → Settings → Secrets 配置。
 // 注意: KV 命名空间 TUNNEL_STATE 是运行时绑定,需在 Dashboard → Settings → Bindings → KV Namespace 绑定。
 const CONFIG_DEFAULTS = {
   CF_API_TOKEN:    "", // [必填] API 令牌: Account→Cloudflare Tunnel→Edit; Zone→DNS→Edit; Zone→Zone→Read
@@ -1055,7 +1055,7 @@ background:var(--side2);color:var(--sub);font-size:12px;line-height:1;cursor:poi
 .search .qx:hover{background:var(--bad);color:#fff}
 .search.has .qx{display:flex}
 .preview{margin-top:14px;padding:10px 12px;border-radius:10px;background:var(--in);font-size:13px;color:var(--sub);white-space:nowrap;overflow-x:auto;line-height:1.6}
-.preview b{color:var(--text)}
+.preview b{color: #f8892b}
 .btn{display:inline-flex;align-items:center;justify-content:center;gap:6px;border:0;border-radius:10px;padding:11px 16px;font-size:14px;font-weight:600;cursor:pointer;color:#fff;background:linear-gradient(135deg,var(--brand),var(--brand2));white-space:nowrap}
 .btn.sm{padding:6px 11px;font-size:12.5px;font-weight:500;background:var(--in);background-image:none;color:var(--text);border:1px solid var(--line)}
 .btn.sm.red{color:var(--bad)}
@@ -1162,7 +1162,7 @@ background:var(--side2);color:var(--sub);font-size:12px;line-height:1;cursor:poi
 </style></head><body>
 <div class="app">
   <aside class="sidenav" id="sidenav">
-    <div class="brand"><span class="ic">☁️</span><span>隧道管理</span></div>
+    <div class="brand"><span class="ic">☁️</span><span>隧道管理面板</span></div>
     <nav class="nav">
       <a data-v="dash" class="on"><span class="i">📊</span>仪表板</a>
       <a data-v="tunnels"><span class="i">⚙️</span>Tunnel 管理</a>
