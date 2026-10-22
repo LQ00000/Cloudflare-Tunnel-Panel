@@ -1,7 +1,11 @@
 // Cloudflare Worker: Cloudflare Tunnel 管理面板
 // 环境变量 (Settings → Variables and Secrets):
-//   CF_API_TOKEN     API 令牌, 权限: 权限: Argo Tunnel → Read & Edit；DNS → Read & Edit；Domains → Read & Edit
-//   CF_ACCOUNT_ID    账户 ID
+//   CF_ACCOUNT_ID    账户 ID，创建token时显示
+//   CF_API_TOKEN     API 令牌, 权限: 
+//        整个账户：DNS & Zone → Account DNS Settings → Read & Edit；DNS View → Read & Edit;
+//                 Argo Tunnel → Read & Edit；
+//        所有域名：DNS & Zone → DNS → Read & Edit;Zone → Read & Edit;Zone DNS Settings → Read & Edit;Zone Settings → Read & Edit;
+
 //   PASSWORD         登录密码 (必填), 至少 6 位
 //   SESSION_SECRET   会话签名密钥 (可选), 推荐设置一串随机字符，否则自动由 PASSWORD 派生 (改密码后所有人需重新登录)
 //   DEFAULT_SERVICE  本地服务默认地址, 如 http://localhost:8001 (可选)
@@ -11,20 +15,22 @@
 // 访问方式: 打开 https://你的域名 , 输入 PASSWORD 登录后进入管理面板。
 //
 // 提醒逻辑: 每次打开列表时比对隧道在线状态, 与上次相比发生变化才提醒 (上/下线各一次)
-// 首次记录不发提醒。比较的结果保存在 KV 中, 需要绑定 KV 命名空间:
-//   变量名 TUNNEL_STATE (Settings → Bindings → KV Namespace)
-// 未绑定 KV 时不会发送提醒。如需定时在后台检查 (即使没人打开面板), 可在
+// 首次记录不发提醒。比较的结果保存在 D1 或 KV 中 (二选一):
+//   推荐 D1: Settings → Bindings → D1 Database, 变量名 TUNNEL_DB
+//            首次使用前执行: CREATE TABLE IF NOT EXISTS state (k TEXT PRIMARY KEY, v TEXT NOT NULL);
+//   或 KV:   Settings → Bindings → KV Namespace, 变量名 TUNNEL_STATE
+// 未绑定存储时不会发送提醒。如需定时在后台检查 (即使没人打开面板), 可在
 // Triggers → Cron 中添加 * /5 * * * * , 并在 Worker 入口加一个 scheduled 处理
 
 // ============================ 配置填写区 ============================
 // 推荐用 Dashboard → Settings → Secrets 配置。
-// 注意: KV 命名空间 TUNNEL_STATE 是运行时绑定,需在 Dashboard → Settings → Bindings → KV Namespace 绑定。
+// 注意: D1/KV 是运行时绑定, 需在 Dashboard → Settings → Bindings 里绑定 (D1 优先于 KV)。
 const CONFIG_DEFAULTS = {
-  CF_API_TOKEN:    "", // [必填] API 令牌: 权限: Argo Tunnel → Read & Edit；DNS → Read & Edit；Domains → Read & Edit
-  CF_ACCOUNT_ID:   "", // [必填] Cloudflare 账户 ID, Workers 页面右侧可查
+  CF_API_TOKEN:    "", // [必填] API 令牌, 权限参考上述说明
+  CF_ACCOUNT_ID:   "", // [必填] Cloudflare 账户 ID,创建token时会提示
   PASSWORD:        "", // [必填] 面板登录密码, 至少 6 位
-  SESSION_SECRET:  "", // [可选] 会话签名密钥, 填一串随机字符; 留空则自动由 PASSWORD 派生
-  DEFAULT_SERVICE: "", // [可选] 新建/编辑隧道的默认本地服务地址, 默认 http://localhost:8001
+  SESSION_SECRET:  "XuWj9JxxhlHTXhcT8cF4761451F4491e93BcD629039c4", // [可选] 会话签名密钥, 填一串随机字符; 留空则自动由 PASSWORD 派生
+  DEFAULT_SERVICE: "http://localhost:8001", // [可选] 新建/编辑隧道的默认本地服务地址, 默认 http://localhost:8001
   TG_BOT_TOKEN:    "", // [可选] Telegram 机器人 Token; 也可在面板"Telegram 配置"里保存到 KV
   TG_CHAT_ID:      "", // [可选] Telegram 接收者 chat_id: 私聊填自己的正数 ID, 群组填负数
 };
@@ -68,10 +74,12 @@ function zhError(errors) {
 }
 
 async function cf(env, path, method = "GET", body) {
+  // env.cfToken/cfAcc 由 handleApi 根据当前所选账号写入 (默认回落到 env 配置)
+  const token = env.cfToken || env.CF_API_TOKEN;
   const r = await fetch(API + path, {
     method,
     headers: {
-      Authorization: "Bearer " + env.CF_API_TOKEN,
+      Authorization: "Bearer " + token,
       "Content-Type": "application/json",
     },
     body: body ? JSON.stringify(body) : undefined,
@@ -106,7 +114,8 @@ async function listZones(env) {
 async function cleanDns(env, tunnelId, hosts) {
   let dns = 0;
   let dnsFailed = false;
-  if (!hosts.length) return { dns, dnsFailed };
+  let dnsErr = "";
+  if (!hosts.length) return { dns, dnsFailed, dnsErr };
   try {
     const zones = await listZones(env);
     const target = tunnelId + ".cfargotunnel.com";
@@ -123,8 +132,9 @@ async function cleanDns(env, tunnelId, hosts) {
     }
   } catch (e) {
     dnsFailed = true;
+    dnsErr = String((e && e.message) || e); // 通常是当前账号的 Token 缺 Zone→DNS→Edit 权限
   }
-  return { dns, dnsFailed };
+  return { dns, dnsFailed, dnsErr };
 }
 
 // 检查域名上已有的 DNS 记录: 只允许"不存在"或"已指向本隧道", 其他任何记录一律报错, 绝不覆盖
@@ -232,7 +242,7 @@ function pwaResponse(path) {
     );
   if (path === "/sw.js")
     return new Response("self.addEventListener('fetch',function(){});", {
-      headers: { "Content-Type": "text/javascript" },
+      headers: { "Content-Type": "text/javascript", "Cache-Control": "no-store" },
     });
   return null;
 }
@@ -407,39 +417,100 @@ const chatKey = async (env, name) => "chat:" + (await hmac(env, "chat:" + name))
 
 const META_KEY = "meta:settings";
 
+// ---- 存储抽象层: D1 优先, 未绑定 D1 时回退 KV ----
+// 两种后端同一个键值语义: get(key)->json|null, put(key,json), del(key)
+// D1 表: CREATE TABLE IF NOT EXISTS state (k TEXT PRIMARY KEY, v TEXT NOT NULL);
+// 绑定名: D1 数据库用 TUNNEL_DB (Settings → Bindings → D1 Database), KV 仍用 TUNNEL_STATE。
+// D1 无 KV 的最终一致性延迟问题 (同连接读写一致), 更适合本面板频繁读写状态的模式。
+const store = (env) => env.TUNNEL_DB || env.TUNNEL_STATE || null;
+const isD1 = (b) => !!b && typeof b.prepare === "function" && typeof b.batch === "function";
+
+async function storeGet(env, key) {
+  const b = store(env);
+  if (!b) return null;
+  if (isD1(b)) {
+    try {
+      const r = await b.prepare("SELECT v FROM state WHERE k = ?1").bind(key).first();
+      if (!r) return null;
+      return JSON.parse(r.v);
+    } catch (e) {
+      return null; // 表不存在等异常按"无数据"处理, 与 KV 未写入一致
+    }
+  }
+  return await b.get(key, "json");
+}
+
+async function storePut(env, key, val) {
+  const b = store(env);
+  if (!b) return;
+  const v = JSON.stringify(val);
+  if (isD1(b)) {
+    await b.prepare("INSERT INTO state (k, v) VALUES (?1, ?2) ON CONFLICT(k) DO UPDATE SET v = ?2").bind(key, v).run();
+    return;
+  }
+  return await b.put(key, v);
+}
+
+async function storeDel(env, key) {
+  const b = store(env);
+  if (!b) return;
+  if (isD1(b)) {
+    await b.prepare("DELETE FROM state WHERE k = ?1").bind(key).run();
+    return;
+  }
+  return await b.delete(key);
+}
+
 async function getMeta(env) {
-  const meta = { chats: [], alerts: {}, botToken: "", paused: null };
-  if (!env.TUNNEL_STATE) return meta;
-  const saved = (await env.TUNNEL_STATE.get(META_KEY, "json")) || {};
+  const meta = { chats: [], alerts: {}, botToken: "", paused: null, accounts: [], curAcc: "" };
+  if (!store(env)) return meta;
+  const saved = (await storeGet(env, META_KEY)) || {};
   meta.alerts = (saved && saved.alerts) || {};
   // 一次性迁移: 旧版本"提醒默认开"曾为每个隧道写入 {on:true}, 这里统一清回默认关。
   // 之后 saveMeta 总会写 alertsV2 标记, 保证只清一次, 不影响用户之后手动开启的开关
   if (saved && !saved.alertsV2 && Object.keys(meta.alerts).length) {
     meta.alerts = {};
-    await env.TUNNEL_STATE.put(META_KEY, JSON.stringify({ ...saved, alerts: {}, alertsV2: true }));
+    await storePut(env, META_KEY, { ...saved, alerts: {}, alertsV2: true });
   }
   meta.botToken = str(saved && saved.botToken);
   meta.paused = (saved && saved.paused) || null;
+  meta.accounts = Array.isArray(saved && saved.accounts) ? saved.accounts : [];
+  meta.curAcc = str(saved && saved.curAcc);
   for (const raw of (saved && saved.chats) || []) {
     const name = str(raw);
-    const resolved = isChatId(name) ? "" : str(await env.TUNNEL_STATE.get(await chatKey(env, name), "text"));
+    const resolved = isChatId(name) ? "" : str((await storeGet(env, await chatKey(env, name)) || ""));
     meta.chats.push({ name, id: isChatId(name) ? name : resolved, ok: isChatId(name) || isChatId(resolved) });
   }
   return meta;
 }
 
 async function saveMeta(env, meta) {
-  if (!env.TUNNEL_STATE) return;
-  await env.TUNNEL_STATE.put(
-    META_KEY,
-    JSON.stringify({
-      chats: meta.chats.map((c) => c.name),
-      alerts: meta.alerts,
-      alertsV2: true, // 已完成"提醒默认关"迁移的标记 (见 getMeta)
-      botToken: meta.botToken || "",
-      paused: meta.paused || null,
-    })
-  );
+  if (!store(env)) return;
+  await storePut(env, META_KEY, {
+    chats: meta.chats.map((c) => c.name),
+    alerts: meta.alerts,
+    alertsV2: true, // 已完成"提醒默认关"迁移的标记 (见 getMeta)
+    botToken: meta.botToken || "",
+    paused: meta.paused || null,
+    accounts: meta.accounts || [],
+    curAcc: meta.curAcc || "",
+  });
+}
+
+// ---- 多账号 ----
+// accounts: [{name, token, acc}] 保存到 D1/KV; env 里的 CF_API_TOKEN/CF_ACCOUNT_ID 永远作为
+// 名为"默认账号"的隐式账号存在 (不可删除), 未选账号或存储不可用时回退到它。
+// 提醒 (alerts/watch/隧道状态) 按账号隔离: 键里带账号 ID, 互不串扰。
+function accountList(meta, env) {
+  const list = [];
+  if (env.CF_API_TOKEN && env.CF_ACCOUNT_ID) list.push({ name: "默认账号", token: "", acc: env.CF_ACCOUNT_ID, builtin: true });
+  for (const a of (meta && meta.accounts) || [])
+    if (a && str(a.acc)) list.push({ name: str(a.name) || str(a.acc), token: str(a.token), acc: str(a.acc) });
+  return list;
+}
+function pickAccount(meta, env, sel) {
+  const list = accountList(meta, env);
+  return list.find((a) => a.acc === str(sel)) || list[0] || null;
 }
 
 const chatTargets = (env, meta) => {
@@ -450,7 +521,7 @@ const chatTargets = (env, meta) => {
 };
 
 const alertsPayload = (env, meta, now = Date.now()) => ({
-  kv: !!env.TUNNEL_STATE,
+  kv: !!store(env),
   bot: !!env.TG_BOT_TOKEN || !!meta.botToken,
   chats: meta.chats.map((c) => ({ name: c.name, id: c.id, ok: c.ok })),
   targets: chatTargets(env, meta).length,
@@ -463,15 +534,15 @@ const alertsPayload = (env, meta, now = Date.now()) => ({
 });
 
 function requireKv(env) {
-  if (!env.TUNNEL_STATE)
-    throw new Error("未绑定 KV 命名空间 TUNNEL_STATE, 无法保存提醒配置 (Settings → Bindings → KV Namespace)");
+  if (!store(env))
+    throw new Error("未绑定存储: 请绑定 D1 数据库 TUNNEL_DB 或 KV 命名空间 TUNNEL_STATE (Settings → Bindings)");
 }
 
 // ---- 在线状态与提醒 ----
-// KV 键:
-//   meta:settings      { chats: [...], alerts: { [tunnelId]: { on: false } } }
-//   tunnel:state:<id>  { on: 上次记录的状态, at: 时间 }
-//   watch:<签名>        { at: 上次检查时间 }
+// 存储键 (D1 表 state 的 k 列 / KV 键, 语义相同):
+//   meta:settings            { chats: [...], alerts: { [tunnelId]: { on: false } }, accounts: [...], curAcc }
+//   tunnel:state:<acc>:<id>  { on: 上次记录的状态, at: 时间 } (按账号隔离)
+//   watch:<签名>              { at: 上次检查时间 }
 // 与上次记录相比发生变化才提醒; 提醒前先写入新状态, 所以同一次变化只会提醒一次。
 const isUp = (t) => t.status === "healthy";
 const ST_TEXT = { healthy: "在线", degraded: "降级", down: "离线", inactive: "未启用" };
@@ -483,17 +554,19 @@ const fmtT = (ms, tz = 8) => {
 };
 
 async function readState(env, key) {
-  if (!env.TUNNEL_STATE) return null;
+  if (!store(env)) return null;
   try {
-    return await env.TUNNEL_STATE.get(key, "json");
+    return await storeGet(env, key);
   } catch (e) {
     return null;
   }
 }
 
 async function runChecks(env, list) {
-  const kv = env.TUNNEL_STATE;
+  const kv = store(env);
   const now = Date.now();
+  // 提醒状态按账号隔离 (多账号互不串扰)
+  const accScope = env.cfAcc || env.CF_ACCOUNT_ID || "";
   // conns_active_at: 隧道建立首条到 Cloudflare 边缘连接的时间 (官方"运行时间"同源), 空=从未连接
   const tunnels = list.map((t) => ({ id: t.id, name: t.name, status: t.status, up: isUp(t), since: Date.parse(t.conns_active_at || "") || 0 }));
   const result = {
@@ -505,7 +578,7 @@ async function runChecks(env, list) {
     alertOn: {},
     alert: { sent: 0, error: "", last: 0, paused: false },
   };
-  if (!kv) return result; // 没有 KV 就只展示状态, 不发提醒
+  if (!kv) return result; // 没有 KV/D1 就只展示状态, 不发提醒
 
   const meta = await getMeta(env);
   // 提醒默认关: 只有 meta.alerts[id].on === true 才发
@@ -514,21 +587,21 @@ async function runChecks(env, list) {
   // until:0 = 手动暂停; until>now = 限时暂停
   result.alert.paused = !!meta.paused;
   result.alert.pausedUntil = (meta.paused && meta.paused.until > now ? meta.paused.until : 0) || 0;
-  const watchKey = "watch:" + (await hmac(env, "watch:" + env.CF_ACCOUNT_ID));
+  const watchKey = "watch:" + (await hmac(env, "watch:" + accScope));
   const watch = await readState(env, watchKey);
   result.alert.last = (watch && watch.at) || 0;
 
   // 距离上次检查不足 20 秒就不重复比对, 避免反复刷新把一次抖动看成多次
   if (watch && now - watch.at < MIN_GAP_MS) return result;
 
-  const prev = await Promise.all(tunnels.map((t) => readState(env, "tunnel:state:" + t.id)));
+  const prev = await Promise.all(tunnels.map((t) => readState(env, "tunnel:state:" + accScope + ":" + t.id)));
   const changed = tunnels.filter((t, i) => prev[i] && !!prev[i].on !== t.up && result.alertOn[t.id]);
 
   // 先写状态再发消息: 并发请求下同一次变化也只提醒一次
   await Promise.all(
-    tunnels.map((t) => kv.put("tunnel:state:" + t.id, JSON.stringify({ on: t.up, at: now })))
+    tunnels.map((t) => storePut(env, "tunnel:state:" + accScope + ":" + t.id, { on: t.up, at: now }))
   );
-  await kv.put(watchKey, JSON.stringify({ at: now }), { expirationTtl: 7 * 24 * 3600 });
+  await storePut(env, watchKey, { at: now });
 
   if (!changed.length) return result;
   if (result.alert.paused) {
@@ -559,6 +632,8 @@ const setCookie = (value, maxAge) =>
 async function handleApi(request, env, path) {
   const d = await request.json().catch(() => ({}));
   const uuid = (v) => UUID_RE.test(str(v));
+  // 前端在所有请求里带 acc (当前所选账号); 32 位 hex 才作为有效选择
+  if (/^[0-9a-f]{32}$/i.test(str(d.acc))) env.cfAcc = str(d.acc).toLowerCase();
 
   // 登录 / 退出 (不需要已登录)
   if (path === "/api/login") {
@@ -608,7 +683,7 @@ async function handleApi(request, env, path) {
       }
       if (token) meta.botToken = token;
       if (name) {
-        if (!isChatId(name) && id) await env.TUNNEL_STATE.put(await chatKey(env, name), id);
+        if (!isChatId(name) && id) await storePut(env, await chatKey(env, name), id);
         if (!meta.chats.some((c) => c.name === name)) meta.chats.push({ name, id, ok: true });
       }
       if (!meta.botToken) return json({ error: "请填写 Bot Token (或配置环境变量 TG_BOT_TOKEN)" }, 400);
@@ -652,8 +727,8 @@ async function handleApi(request, env, path) {
       // 先真正发一条消息确认可用, 成功了再保存
       const sent = await tgSend(env, id, "✅ Cloudflare 隧道管理: 提醒已连通", str(d.token) || meta.botToken);
       if (!sent.ok) return json({ error: sent.error }, 400);
-      if (!env.TUNNEL_STATE) return json(alertsPayload(env, meta));
-      if (!isChatId(name)) await env.TUNNEL_STATE.put(await chatKey(env, name), id);
+      if (!store(env)) return json(alertsPayload(env, meta));
+      if (!isChatId(name)) await storePut(env, await chatKey(env, name), id);
       if (!meta.chats.some((c) => c.name === name)) meta.chats.push({ name, id, ok: true });
       await saveMeta(env, meta);
       return json({ ...alertsPayload(env, meta), added: name });
@@ -661,8 +736,8 @@ async function handleApi(request, env, path) {
     if (str(d.action) === "remove") {
       const name = str(d.chat);
       meta.chats = meta.chats.filter((c) => c.name !== name);
-      if (env.TUNNEL_STATE) {
-        await env.TUNNEL_STATE.delete(await chatKey(env, name));
+      if (store(env)) {
+        await storeDel(env, await chatKey(env, name));
         await saveMeta(env, meta);
       }
       return json(alertsPayload(env, meta));
@@ -673,7 +748,15 @@ async function handleApi(request, env, path) {
   if (!env.CF_API_TOKEN || !env.CF_ACCOUNT_ID)
     return json({ error: "未配置环境变量 CF_API_TOKEN / CF_ACCOUNT_ID" }, 500);
 
-  const acc = env.CF_ACCOUNT_ID;
+  // ---- 多账号解析: env.cfAcc 是前端本次请求选择的账号 ID ----
+  // 无 KV / 未选 / 选择不存在时, 回退到 env 配置的默认账号 (cf() 里 token 同理)
+  const meta0 = store(env) ? await getMeta(env) : { accounts: [] };
+  const actx = pickAccount(meta0, env, env.cfAcc);
+  if (!actx) return json({ error: "未配置任何 Cloudflare 账号 (环境变量或面板多账号管理)" }, 500);
+  env.cfToken = actx.token || env.CF_API_TOKEN; // 该账号专属 API Token (默认账号用 env)
+  env.cfAcc = actx.acc;
+
+  const acc = env.cfAcc;
   const base = `/accounts/${acc}/cfd_tunnel`;
 
   if (["/api/token", "/api/detail", "/api/update", "/api/delete", "/api/alert", "/api/route", "/api/uptime"].includes(path) && !uuid(d.id))
@@ -682,8 +765,65 @@ async function handleApi(request, env, path) {
   const svcErr = (s) =>
     SERVICE_RE.test(s) ? "" : "本地服务地址格式不正确, 例如 http://localhost:8001、tcp://localhost:22";
 
+  // ---- 多账号管理 ----
+  if (path === "/api/acc") {
+    // list/switch 不强制要求存储: 未绑 KV/D1 时只有环境变量默认账号, 面板照常可用;
+    // add/del 需要持久化, 才要求绑定存储
+    const meta = await getMeta(env);
+    const action = str(d.action);
+    if (action === "list") {
+      return json({
+        accounts: accountList(meta, env).map((a) => ({ name: a.name, acc: a.acc, builtin: !!a.builtin })),
+        cur: acc,
+        persistent: !!store(env),
+      });
+    }
+    if (action === "add") {
+      requireKv(env);
+      const name = str(d.name).trim().slice(0, 64);
+      const token = str(d.token);
+      const accId = str(d.acc);
+      // 名称规则: 1-64 字符, 允许中文/英文字母/数字/空格/@._-+ 等; 至少含一个文字(字母/汉字/数字),
+      // 不能全是标点符号 (防止只填 "..." 或 "---" 这种无法辨认的名字)
+      if (!name || !/[\p{L}\p{N}]/u.test(name))
+        return json({ error: "账号名称不能为空, 且需至少包含一个文字或数字 (不能全是标点符号)" }, 400);
+      if (!/^[0-9a-f]{32}$/i.test(accId) || !token)
+        return json({ error: "请填写 32 位账户 ID 和该账户的 API Token" }, 400);
+      if (accountList(meta, env).some((a) => a.acc === accId)) return json({ error: "该账户 ID 已存在" }, 400);
+      // 先验证: 用新 Token 请求该账户, 通得过才保存
+      try {
+        await cf({ cfToken: token, CF_API_TOKEN: token }, `/accounts/${accId}`);
+      } catch (e) {
+        return json({ error: "账号验证失败: " + (e && e.message) }, 400);
+      }
+      meta.accounts.push({ name, token, acc: accId });
+      await saveMeta(env, meta);
+      return json({ ok: true, accounts: accountList(meta, env).map((a) => ({ name: a.name, acc: a.acc, builtin: !!a.builtin })) });
+    }
+    if (action === "del") {
+      requireKv(env);
+      const accId = str(d.acc);
+      const builtin = accountList(meta, env).find((a) => a.acc === accId && a.builtin);
+      if (builtin) return json({ error: "环境变量配置的默认账号不能删除" }, 400);
+      meta.accounts = meta.accounts.filter((a) => str(a.acc) !== accId);
+      if (meta.curAcc === accId) meta.curAcc = "";
+      await saveMeta(env, meta);
+      return json({ ok: true, accounts: accountList(meta, env).map((a) => ({ name: a.name, acc: a.acc, builtin: !!a.builtin })) });
+    }
+    if (action === "switch") {
+      const accId = str(d.acc);
+      if (!accountList(meta, env).some((a) => a.acc === accId)) return json({ error: "账号不存在" }, 400);
+      if (store(env)) {
+        meta.curAcc = accId; // 记住上次选择, 下次打开面板默认用它
+        await saveMeta(env, meta);
+      }
+      return json({ ok: true, cur: accId });
+    }
+    return json({ error: "未知操作" }, 400);
+  }
+
   if (path === "/api/init")
-    return json({ zones: await listZones(env), service: env.DEFAULT_SERVICE || "" });
+    return json({ zones: await listZones(env), service: env.DEFAULT_SERVICE || "", cur: acc, envAcc: env.CF_ACCOUNT_ID || "" });
 
   if (path === "/api/create") {
     const name = str(d.name), service = str(d.service);
@@ -712,11 +852,8 @@ async function handleApi(request, env, path) {
       else delete meta.alerts[id];
       await saveMeta(env, meta);
     } else if (d.action === "skip") {
-      // 把上次记录改成当前状态, 等于吞掉这一次变化
-      await env.TUNNEL_STATE.put(
-        "tunnel:state:" + id,
-        JSON.stringify({ on: !!d.up, at: Date.now() })
-      );
+      // 把上次记录改成当前状态, 等于吞掉这一次变化 (带账号作用域, 与 runChecks 一致)
+      await storePut(env, "tunnel:state:" + acc + ":" + id, { on: !!d.up, at: Date.now() });
     } else if (d.action !== "get") return json({ error: "未知操作" }, 400);
     return json({ ...alertsPayload(env, meta), id, on: !!(meta.alerts[id] && meta.alerts[id].on === true) });
   }
@@ -879,8 +1016,8 @@ async function handleApi(request, env, path) {
     } catch (e) {}
     await cf(env, `${base}/${d.id}`, "DELETE");
     const clean = await cleanDns(env, d.id, hosts);
-    if (env.TUNNEL_STATE) {
-      await env.TUNNEL_STATE.delete("tunnel:state:" + d.id).catch(() => {});
+    if (store(env)) {
+      await storeDel(env, "tunnel:state:" + acc + ":" + d.id).catch(() => {});
       const meta = await getMeta(env);
       if (meta.alerts[d.id]) {
         delete meta.alerts[d.id];
@@ -1050,9 +1187,14 @@ body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang 
 .sidenav .foot a:hover{background:var(--side2);color:#e05252}
 .sidenav .foot a:hover .i{color:#e05252}
 .sidenav .foot a:hover .lo{opacity:1;transform:none}
+.am-item{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:9px 11px;border:1px solid var(--line);border-radius:10px;margin-bottom:8px;background:var(--in)}
 .main{flex:1;min-width:0;display:flex;flex-direction:column;overflow:hidden}
-.topbar{display:flex;align-items:center;gap:10px;padding:calc(env(safe-area-inset-top,0px) + 12px) 20px 12px;background:var(--card);border-bottom:1px solid var(--line);flex:none}
-.topbar h2{margin:0;font-size:16px;flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.topbar{display:flex;align-items:center;gap:10px;padding:calc(env(safe-area-inset-top,0px) + 12px) 20px 12px;background:var(--card);border-bottom:1px solid var(--line);flex:none;position:relative}
+/* 标题绝对定位居中于整条顶栏(不参与 flex 布局); 账号组 margin-right:auto 贴左 */
+.topbar h2{margin:0;font-size:16px;position:absolute;left:50%;transform:translateX(-50%);max-width:40%;text-align:center;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.accwrap{display:flex;align-items:center;gap:9px;flex:none;margin-right:auto}
+.aclabel{font-size:13.5px;color:#f0932f;font-weight:700;white-space:nowrap}
+.accwrap select{width:auto;min-width:150px;max-width:280px;padding:6px 9px;font-size:13.5px;text-align:left;font-weight:600}
 .content{flex:1;overflow-y:auto;-webkit-overflow-scrolling:touch;padding:18px 20px calc(env(safe-area-inset-bottom,0px) + 40px)}
 .wrap{max-width:1400px;margin:0 auto}.view{display:none}.view.on{display:block}
 .card{background:var(--card);border-radius:14px;padding:16px;margin-bottom:14px;box-shadow:0 2px 12px rgba(0,0,0,.06);border:1px solid var(--line)}
@@ -1191,6 +1333,11 @@ background:var(--side2);color:var(--sub);font-size:12px;line-height:1;cursor:poi
     <div class="topbar">
       <button class="side-toggle" id="menu">☰</button>
       <h2 id="ttl">仪表板</h2>
+      <div class="accwrap">
+        <span class="aclabel">当前账户</span>
+        <select id="acc_sel" title="切换 Cloudflare 账号"></select>
+      </div>
+      <button class="btn sm" id="acc_mgr" title="管理账号"><svg xmlns="http://www.w3.org/2000/svg" width="1em" height="1em" viewBox="0 0 16 16" style="font-size:15px;vertical-align:-2px"><path d="M0 0h16v16H0z" fill="none"/><path fill="#d86d16" d="M6 5a2 2 0 1 1 4 0a2 2 0 0 1-4 0m-.5 3h5A1.5 1.5 0 0 1 12 9.5c0 1.116-.459 2.01-1.212 2.615C10.047 12.71 9.053 13 8 13s-2.047-.29-2.788-.885C4.46 11.51 4 10.616 4 9.5A1.5 1.5 0 0 1 5.5 8M8 0a8 8 0 1 0 0 16A8 8 0 0 0 8 0M1 8a7 7 0 1 1 14 0A7 7 0 0 1 1 8"/></svg></button>
       <button class="btn sm" id="refresh">刷新</button>
       <button class="btn sm" id="theme" title="切换白天/黑夜主题">🌙</button>
     </div>
@@ -1226,22 +1373,22 @@ background:var(--side2);color:var(--sub);font-size:12px;line-height:1;cursor:poi
       <section class="view" id="v-tg">
         <div class="card">
           <h3><span>Telegram 提醒</span><span class="pill" id="tg_state">-</span></h3>
-          <div class="row">
+          <div class="row" style="align-items:flex-end">
             <div style="flex:1;min-width:0">
               <label for="tg_chat">接收者 chat_id</label>
-              <input id="tg_chat" placeholder="私聊填自己的正数 ID; 群组填 -100xxx" autocapitalize="off" autocomplete="off">
+              <input id="tg_chat" placeholder="正数 ID 或 -100xxx" autocapitalize="off" autocomplete="off">
             </div>
-            <div style="flex:1.2;min-width:0">
+            <div style="flex:2;min-width:0">
               <label for="tg_token">Bot Token</label>
               <input id="tg_token" placeholder="例如 123456789:AbCdefGhIJKlmNoPQRsTUVwxyZ" autocapitalize="off" autocomplete="off" spellcheck="false">
             </div>
+            <button class="btn" id="tg_save" style="flex:none;padding:11px 18px;white-space:nowrap">保存推送配置</button>
           </div>
-          <div class="btns" style="margin-top:14px">
-            <button class="btn gray" id="tg_test">测试发送</button>
-            <button class="btn" id="tg_save">保存到 KV</button>
-            <button class="btn gray" id="tg_pause">⏸ 暂停推送</button>
+          <div class="row" style="margin-top:12px">
+            <button class="btn gray" id="tg_test" style="flex:none;width:76px">测试发送</button>
+            <button class="btn gray" id="tg_pause" style="flex:none;width:96px">⏸ 暂停推送</button>
           </div>
-          <div class="hint" style="margin-top:10px">chat_id 是<strong>接收者</strong>的 ID, 不是机器人的: 想私聊收提醒, 先在 Telegram 里给机器人发一句 /start, 再填<strong>你自己的正数数字 ID</strong> (不知道自己的 ID 可问 @userinfobot); 想发到群组/频道, 填负数 ID (群组需先把机器人拉进群) 或 @公开用户名。填写后点"保存到 KV"写入 KV; "测试发送"用当前填写的配置发一条测试消息。暂停推送期间状态仍会检查, 只是不发送消息。</div>
+          <div class="hint" style="margin-top:10px">chat_id 是<strong>接收者</strong>的 ID, 不是机器人的: 想私聊收提醒, 先在 Telegram 里给机器人发一句 /start, 再填<strong>你自己的正数数字 ID</strong> (不知道自己的 ID 可问 @userinfobot); 想发到群组/频道, 填负数 ID (群组需先把机器人拉进群) 或 @公开用户名。填写后点"保存推送配置"写入存储; "测试发送"用当前填写的配置发一条测试消息。暂停推送期间状态仍会检查, 只是不发送消息。</div>
           <div id="tg_list" style="margin-top:10px"></div>
         </div>
 
@@ -1253,7 +1400,7 @@ background:var(--side2);color:var(--sub);font-size:12px;line-height:1;cursor:poi
             3. 首次记录到的隧道只保存状态不发送提醒, 部署后不会刷屏。<br>
             4. 打开面板或点刷新时会检查一次; 若要无人值守也持续检查, 给 Worker 加一个 Cron 触发器
             (例如 <code>*/5 * * * *</code>), 代码里的 <code>scheduled</code> 处理会自动执行同样的检查。<br>
-            5. Bot Token / 接收者 / 暂停状态都保存在 KV 命名空间 <strong>TUNNEL_STATE</strong>;
+            5. Bot Token / 接收者 / 暂停状态都保存在 D1 (TUNNEL_DB) 或 KV (TUNNEL_STATE);
             也可用环境变量 <code>TG_BOT_TOKEN</code> 作为兜底 Token。<br>
             6. 暂停推送期间状态仍照常检查和记录, 只是暂时不发送 Telegram 消息。
           </div>
@@ -1314,6 +1461,21 @@ background:var(--side2);color:var(--sub);font-size:12px;line-height:1;cursor:poi
   <div class="btns"><button class="btn gray" id="e_cancel">取消</button><button class="btn" id="e_save">保存</button></div>
 </div>
 
+<div class="modal" id="mAccMgr">
+  <h3><span>账号管理</span><button class="x" id="am_x">✕</button></h3>
+  <div id="am_body"></div>
+  <div style="border-top:1px solid var(--line);margin-top:14px;padding-top:14px">
+    <div class="row">
+      <div style="flex:1;min-width:0"><label>账号名称 (邮箱/中英文/数字, 不能全是标点)</label><input id="am_name" placeholder="例如 admin@x.com / 主账号 / VPS商2" autocomplete="off"></div>
+      <div style="flex:1.2;min-width:0"><label>账户 ID (32 位)</label><input id="am_acc" placeholder="Cloudflare 账户 ID" autocapitalize="off" autocomplete="off" spellcheck="false"></div>
+    </div>
+    <label>该账户的 API Token (权限同环境变量要求)</label>
+    <input id="am_token" placeholder="粘贴后点添加, 会先验证再保存" autocapitalize="off" autocomplete="off" spellcheck="false">
+    <div class="btns" style="margin-top:12px"><button class="btn" id="am_add">添加账号</button></div>
+    <div class="hint" style="margin-top:8px">验证通过才保存; Token 只存在D1, 不会下发到页面。环境变量配置的"默认账号"不可删除。切换账号后隧道列表/提醒规则/域名随账号切换。</div>
+  </div>
+</div>
+
 <div class="mask" id="c_mask"></div>
 <div class="modal confirm" id="mConfirm" data-confirm="1">
   <h3><span class="wi">⚠</span><span id="c_ttl">确认操作</span></h3>
@@ -1363,7 +1525,10 @@ function setBusy(on,msg){
 }
 async function api(path,extra){
   var r,d;
-  try{r=await fetch(path,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(extra||{})})}
+  // 自动携带当前所选账号 (/api/acc 自身除外, 避免循环依赖)
+  var body=extra||{};
+  if(path!=='/api/acc'&&curAcc)body.acc=curAcc;
+  try{r=await fetch(path,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)})}
   catch(e){throw new Error('网络请求失败, 请检查网络后重试')}
   try{d=await r.json()}catch(e){throw new Error('服务返回异常 (HTTP '+r.status+')')}
   if(r.status===401){location.replace('/');throw new Error('登录已过期')}
@@ -1432,11 +1597,109 @@ document.addEventListener('keydown',function(e){
 });
 
 /* ---- 菜单 ---- */
-var titles={dash:'仪表板',tunnels:'Tunnel 管理',tg:'Telegram 配置'};
+/* ---- 多账号 ---- */
+var curAcc='',accNames={},envAccId='';
+function renderAccSel(d){
+  // d: /api/acc list 的返回 {accounts:[{name,acc,builtin}], cur}
+  if(d&&d.cur)curAcc=d.cur;
+  var list=(d&&d.accounts)||[];
+  list.forEach(function(a){accNames[a.acc]=a.name});
+  $('acc_sel').innerHTML=list.map(function(a){
+    return '<option value="'+esc(a.acc)+'"'+(a.acc===curAcc?' selected':'')+'>'+esc(a.name)+'</option>';
+  }).join('');
+}
+async function loadAccs(){
+  try{
+    renderAccSel(await api('/api/acc',{action:'list'}));
+  }catch(e){
+    // 兜底: 接口失败 (旧版本后端/临时故障) 时至少显示环境变量默认账号, 不显示"加载失败"
+    if(envAccId){
+      curAcc=envAccId;accNames[envAccId]='默认账号';
+      $('acc_sel').innerHTML='<option value="'+esc(envAccId)+'" selected>默认账号</option>';
+    }else $('acc_sel').innerHTML='<option value="">默认账号</option>';
+  }
+}
+async function initZones(){
+  try{
+    var d=await api('/api/init');
+    if(d.envAcc)envAccId=d.envAcc;
+    $('zone').innerHTML=d.zones.length?d.zones.map(function(z){return '<option value="'+esc(z.id)+'">.'+esc(z.name)+'</option>'}).join(''):'<option value="">无可用域名</option>';
+    if(d.service)$('svc').value=d.service;
+    preview();
+  }catch(e){
+    $('zone').innerHTML='<option value="">加载失败</option>';
+    fail(e);
+  }
+}
+$('acc_sel').addEventListener('change',async function(){
+  var v=this.value;
+  // 遮罩只盖住切换+列表首屏; 路由详情照旧后台渐进加载, 不拖住遮罩
+  setBusy(true,'账号切换中...');
+  try{
+    try{await api('/api/acc',{action:'switch',acc:v})}catch(e){}
+    curAcc=v;renderAccSel({accounts:Object.keys(accNames).map(function(k){return {name:accNames[k],acc:k}}),cur:v});
+    metaCache={}; // 新账号路由缓存清空
+    await Promise.all([loadList(),initZones()]); // 列表 + 域名下拉都随账号刷新
+  }finally{setBusy(false)}
+  loadTg();
+  loadMeta();
+});
+$('acc_mgr').onclick=function(){openAccMgr()};
+async function openAccMgr(){
+  var b=$('am_body');
+  b.innerHTML='<div class="empty">加载中...</div>';
+  openModal('mAccMgr');
+  try{
+    var d=await api('/api/acc',{action:'list'});
+    b.innerHTML=(d.accounts||[]).map(function(a){
+      return '<div class="am-item"><div style="min-width:0"><b>'+esc(a.name)+'</b>'+
+        '<div style="font-size:11px;color:var(--sub)">'+esc(a.acc)+(a.builtin?' · 环境变量配置':'')+'</div></div>'+
+        (a.builtin?'':'<button class="btn sm red" data-amdel="'+esc(a.acc)+'">删除</button>')+
+        '</div>';
+    }).join('')||'<div class="empty">暂无添加的账号</div>';
+  }catch(e){b.innerHTML='<div class="empty">加载失败</div>';fail(e)}
+}
+$('am_add').onclick=async function(){
+  var b=this,name=$('am_name').value.trim(),acc=$('am_acc').value.trim(),token=$('am_token').value.trim();
+  if(!name||!acc||!token){toast('请填写名称、账户 ID 和 API Token','err');return}
+  b.disabled=true;b.innerHTML='<span class="spin"></span> 验证中';
+  try{
+    var d=await api('/api/acc',{action:'add',name:name,acc:acc,token:token});
+    $('am_name').value='';$('am_acc').value='';$('am_token').value='';
+    toast('账号已添加: '+name);
+    var items=d.accounts||[];accNames={};
+    $('am_body').innerHTML=items.map(function(a){
+      accNames[a.acc]=a.name;
+      return '<div class="am-item"><div style="min-width:0"><b>'+esc(a.name)+'</b>'+
+        '<div style="font-size:11px;color:var(--sub)">'+esc(a.acc)+(a.builtin?' · 环境变量配置':'')+'</div></div>'+
+        (a.builtin?'':'<button class="btn sm red" data-amdel="'+esc(a.acc)+'">删除</button>')+
+        '</div>';
+    }).join('');
+    renderAccSel({accounts:items,cur:curAcc});
+  }catch(e){fail(e)}
+  b.disabled=false;b.innerHTML='添加账号';
+};
+document.addEventListener('click',async function(e){
+  var t=e.target.closest('[data-amdel]');if(!t)return;
+  if(!(await askConfirm('删除该账号? 仅移出面板, 不影响 Cloudflare 账户本身','删除账号','删除')))return;
+  try{
+    var d=await api('/api/acc',{action:'del',acc:t.dataset.amdel});
+    toast('已删除');
+    var items=d.accounts||[];accNames={};
+    $('am_body').innerHTML=items.map(function(a){
+      accNames[a.acc]=a.name;
+      return '<div class="am-item"><div style="min-width:0"><b>'+esc(a.name)+'</b>'+
+        '<div style="font-size:11px;color:var(--sub)">'+esc(a.acc)+(a.builtin?' · 环境变量配置':'')+'</div></div>'+
+        (a.builtin?'':'<button class="btn sm red" data-amdel="'+esc(a.acc)+'">删除</button>')+
+        '</div>';
+    }).join('')||'<div class="empty">暂无添加的账号</div>';
+    renderAccSel({accounts:items,cur:curAcc});
+  }catch(e){fail(e)}
+});
 function show(v){
   document.querySelectorAll('.nav a').forEach(function(a){a.className=a.dataset.v===v?'on':''});
   document.querySelectorAll('.view').forEach(function(s){s.className='view'+(s.id==='v-'+v?' on':'')});
-  $('ttl').textContent=titles[v]||'';
+  $('ttl').textContent=({dash:'仪表板',tunnels:'Tunnel 管理',tg:'Telegram 配置'})[v]||'';
   $('sidenav').className='sidenav';
 }
 document.querySelectorAll('.nav a').forEach(function(a){a.onclick=function(){show(a.dataset.v)}});
@@ -1582,7 +1845,7 @@ async function toggleAlert(id,on,up){
     allAlertOn[id]=!!d.on;renderList();
     toast(d.on?'已开启该隧道的提醒':'已关闭该隧道的提醒');
   }catch(e){
-    if(/KV/.test(e.message))toast('请先绑定 KV 命名空间 TUNNEL_STATE','err');
+    if(/KV/.test(e.message))toast('请先绑定 D1 (TUNNEL_DB) 或 KV (TUNNEL_STATE)','err');
     else fail(e);
   }
 }
@@ -1635,7 +1898,7 @@ $('go').onclick=async function(){
 };
 
 /* ---- Token 弹窗 ---- */
-$('t_x').onclick=closeModal;
+$('t_x').onclick=closeModal;$('am_x').onclick=closeModal;
 function showToken(r,token,fresh){
   $('t_banner').innerHTML='<div class="banner"><span class="ck">✓</span><div class="bd">'+
     (fresh?'隧道创建成功, 复制下面的域名和Token到服务器运行cloudflared':'隧道: <b>'+esc(r.name||r.id)+'</b>')+
@@ -1668,7 +1931,7 @@ async function del(id){
   setBusy(true,'删除tunnel和dns中...');
   try{
     var d=await api('/api/delete',{id:id});
-    toast(d.dnsFailed?'隧道已删除, 但 DNS 记录清理失败, 请到 DNS 页面手动删除':(d.dns?'已删除隧道和 '+d.dns+' 条 DNS 记录':'已删除隧道'));
+    toast(d.dnsFailed?'隧道已删除, 但 DNS 记录清理失败: '+(d.dnsErr||'请到 DNS 页面手动删除'):(d.dns?'已删除隧道和 '+d.dns+' 条 DNS 记录':'已删除隧道'));
     loadList().then(loadMeta);
   }catch(e){fail(e)}
   setBusy(false);
@@ -1730,7 +1993,7 @@ async function saveEdit(){
       sub:$('e_sub').value.trim(),path:$('e_path').value.trim(),service:$('e_svc').value.trim(),
       host:sel&&sel.hostname||'',oldPath:sel&&sel.path||''});
     closeModal();
-    toast(d.dnsFailed?'已保存, 但旧 DNS 记录清理失败, 请手动删除':'修改已保存');
+    toast(d.dnsFailed?'已保存, 但旧 DNS 记录清理失败: '+(d.dnsErr||'请手动删除'):'修改已保存');
     loadList().then(loadMeta);
   }catch(e){fail(e)}
   b.disabled=false;b.innerHTML='保存';
@@ -1777,7 +2040,7 @@ async function rmRoute(host,path){
   try{
     var d=await api('/api/route',{id:routeId,action:'del',hostname:host,path:path});
     renderRoutes(d.rules);
-    toast(d.dnsFailed?'路由已删除, 但 DNS 清理失败, 请手动删除':'路由已删除');
+    toast(d.dnsFailed?'路由已删除, 但 DNS 清理失败: '+(d.dnsErr||'请手动删除'):'路由已删除');
     loadList().then(loadMeta);
   }catch(e){fail(e)}
 }
@@ -1832,10 +2095,10 @@ $('tg_save').onclick=async function(){
   try{
     var d=await api('/api/tg',{action:'save',chat:i.chat,token:i.token});
     $('tg_token').value='';
-    toast('配置已保存到 KV');
+    toast('推送配置已保存');
     renderTg(d);loadList().then(loadMeta);
   }catch(e){fail(e)}
-  b.disabled=false;b.innerHTML='保存到 KV';
+  b.disabled=false;b.innerHTML='保存推送配置';
 };
 $('tg_test').onclick=async function(){
   var i=tgInputs();
@@ -1885,9 +2148,10 @@ applyTheme(savedTheme);
 
 /* ---- 启动 ---- */
 show((location.hash||'').replace('#','')||'dash');
-initZones();
-loadList().then(loadMeta);
-loadTg();
+initZones().catch(function(){}).then(loadAccs).then(function(){
+  loadList().then(loadMeta);
+  loadTg();
+});
 if('serviceWorker' in navigator)navigator.serviceWorker.register('/sw.js',{scope:'/'}).catch(function(){});
 </script></body></html>`;
 
@@ -1895,8 +2159,14 @@ if('serviceWorker' in navigator)navigator.serviceWorker.register('/sw.js',{scope
 // 定时检查 (可选): Worker → Triggers → Cron 添加 */5 * * * * 即可在后台持续检查并提醒。
 export const scheduled = async (event, env, ctx) => {
   env = applyConfig(env); // 顶部"配置填写区"优先
-  if (!env.CF_API_TOKEN || !env.CF_ACCOUNT_ID || !env.TUNNEL_STATE) return;
-  try {
-    await runChecks(env, await listTunnels(env, `/accounts/${env.CF_ACCOUNT_ID}/cfd_tunnel`));
-  } catch (e) {}
+  if (!store(env)) return;
+  // Cron 检查遍历所有账号 (env 默认账号 + 面板添加的账号), 各自独立提醒
+  const meta = await getMeta(env);
+  for (const a of accountList(meta, env)) {
+    try {
+      await runChecks({ ...env, cfToken: a.token || env.CF_API_TOKEN, cfAcc: a.acc },
+        await listTunnels({ ...env, cfToken: a.token || env.CF_API_TOKEN, cfAcc: a.acc },
+          `/accounts/${a.acc}/cfd_tunnel`));
+    } catch (e) {}
+  }
 };
