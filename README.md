@@ -1,39 +1,88 @@
 # Cloudflare Tunnel 管理面板
 
-一个单文件 Cloudflare Worker，提供网页管理面板，用于管理账户下的 Cloudflare Tunnel（原名 Argo Tunnel）：新建/编辑/删除隧道、查看连接 Token、增删域名路由、查看在线状态，并可选地把隧道上线/离线事件通过 Telegram 推送提醒。
+Cloudflare Worker部署的Argo tunnel网页管理面板，用于管理多账户下的 Argo Tunnel：新建/编辑/删除隧道、查看连接 Token、增删域名路由、查看在线状态，并可选地把隧道上线/离线事件通过 Telegram 推送提醒。
 
 整个项目只有 **一个文件**：`_worker.js`（Worker 代码 + 内嵌管理页面，无需构建、无外部依赖）。
 
 ## 功能一览
 
 - **密码登录**：访问面板需输入密码，会话 Cookie 签名有效期 7 天，登录接口有防爆破延时。
-- **隧道管理**：列表展示所有隧道及状态（在线/降级/离线/未启用）、搜索过滤、查看启动 Token、修改名称与本地服务地址、删除隧道。
+- **多账号管理**：顶栏下拉切换 Cloudflare 账号；可在"账号管理"里添加多个账号（各自 API Token，验证后存 D1）；环境变量配置的账号作为默认账号。隧道列表、路由、提醒规则、定时检查均按账号隔离。
+- **隧道管理**：列表展示所有隧道及状态（在线/降级/离线/未启用 + 运行时长）、搜索过滤、查看启动 Token、修改名称与本地服务地址（多路由可选要编辑的那条）、删除隧道。
 - **新建隧道**：选择域名 (Zone)、子域名、可选路径、本地服务地址（如 `http://localhost:8080`、`tcp://localhost:22`），自动创建隧道并自动配置 DNS CNAME 记录。
 - **多路由管理**：在已有隧道上增删"域名 + 路径 → 服务"的 ingress 规则（每条隧道最多 60 条），自动处理 DNS，冲突时拒绝写入。
 - **Telegram 上下线提醒**：状态**发生变化**才推送（上线一次、离线一次），可按隧道逐个开关（**默认关闭**）；支持多个接收者（私聊/群组/频道）、暂停/恢复推送。
 - **PWA**：可安装到桌面/手机主屏，带离线壳页面。
 
-## 快速部署
+## 快速部署（Cloudflare Dashboard）
 
 1. 登录 [Cloudflare Dashboard](https://dash.cloudflare.com) → **Workers & Pages** → **Create** → 创建 Worker，把 `_worker.js` 内容全部粘贴进去，保存。
-2. **【非必须】绑定 KV 命名空间**：Worker → Settings → Bindings → Add → KV Namespace，变量名填 `TUNNEL_STATE`（没有它无法保存提醒配置、接收者等信息）。
-3. **【必须】配置环境变量**：Settings → Variables and Secrets，添加 `CF_API_TOKEN`、`CF_ACCOUNT_ID`、`PASSWORD` 其他变量非必须（详见下表）。
-4. 部署后打开 `https://<Worker 域名>`，输入密码登录即可。
+2. **【必须】绑定 KV 命名空间**：Worker → Settings → Bindings → Add → KV Namespace，变量名填 `TUNNEL_STATE`（没有它无法保存提醒配置、接收者等信息）。
+3. **【必须】配置环境变量**：Settings → Variables and Secrets，添加 `CF_API_TOKEN`、`CF_ACCOUNT_ID`、`PASSWORD`（详见下表）。
+4. 部署后打开 `https://<Worker 域名>/`，输入密码登录即可。
+
 
 ## 环境变量
 
 | 变量 | 必填 | 说明 |
 | --- | --- | --- |
-| `CF_ACCOUNT_ID` | ✅ | Cloudflare 账户 ID,创建token时会显示 |
-| `CF_API_TOKEN` | ✅ | API 令牌 (首页左侧菜单 → 管理账户 → 帐户 API 令牌); 权限：Account → Argo Tunnel → **Read & Edit**；Account DNS Settings → **Read & Edit**；DNS View → **Read & Edit**；Registrar Sandbox Domains → **Read & Admin** |
+| `CF_API_TOKEN` | ✅ | API 令牌。权限见下方「API Token 权限配置」 |
+| `CF_ACCOUNT_ID` | ✅ | Cloudflare 账户 ID（Workers 页面右侧可见） |
 | `PASSWORD` | ✅ | 面板登录密码，至少 6 位 |
-| `SESSION_SECRET` | 可选 | 会话签名密钥，一串随机字符。不设置时由密码派生（改密码会使所有人重新登录） |
-| `TUNNEL_STATE` | 可选 | **KV 命名空间绑定**（Bindings，不是环境变量），存储登录外的全部状态与提醒配置 |
+| `SESSION_SECRET` | 建议 | 会话签名密钥，一串随机字符。不设置时由密码派生（改密码会使所有人重新登录） |
+| `TUNNEL_STATE` | ✅ | **KV 命名空间绑定**（Bindings，不是环境变量），存储登录外的全部状态与提醒配置。**推荐改用 D1**：绑定变量名 `TUNNEL_DB`（建表见下），两者同时绑定时 D1 优先 |
 | `DEFAULT_SERVICE` | 可选 | 新建/编辑隧道时的默认本地服务地址，如 `http://localhost:8080` |
 | `TG_BOT_TOKEN` | 可选 | Telegram 机器人 Token（环境变量兜底；也可在面板里保存到 KV） |
 | `TG_CHAT_ID` | 可选 | 默认接收者 chat_id（环境变量兜底） |
 
-## Telegram 提醒配置(可选)
+## API Token 权限配置
+
+创建 API Token（My Profile → API Tokens → Create Token → Custom token）时，按下面两组勾选。注意区分**账户级（整个账户）**和**区域级（所有域名/Zone Resources 选 All zones）**两组，名字相近但作用完全不同：
+
+**账户级（Account Resources 选整个账户）：**
+
+| 分组 | 权限项 | 级别 |
+| --- | --- | --- |
+| DNS & Zones | Account DNS Settings | Read + Edit |
+| DNS & Zones | DNS View | Read + Edit |
+| Cloudflare Tunnel（或 Argo Tunnel） | Cloudflare Tunnel | Read + Edit |
+
+**区域级（Zone Resources 选"所有域名 / All zones"）：**
+
+| 分组 | 权限项 | 级别 |
+| --- | --- | --- |
+| DNS & Zones | DNS | Read + Edit |
+| DNS & Zones | Zone | Read + Edit |
+| DNS & Zones | Zone DNS Settings | Read + Edit |
+| DNS & Zones | Zone Settings | Read + Edit |
+
+> 最小可用集其实只需：账户级 `Cloudflare Tunnel → Edit` + 区域级 `DNS → Read/Edit`、`Zone → Read`；多勾的项是无害的冗余。常见错误是只配了账户级的 Account DNS Settings/DNS View（管的是账户 DNS 全局设置，不是 Zone 里的 DNS 记录），会导致面板报"该域名已存在 DNS 记录"或删除隧道后 DNS 清理失败——**区域级的 `DNS → Edit` 必须有**。
+
+## 存储选择：D1（推荐）或 KV
+
+KV 有每日写入次数限制且存在最终一致延迟（写后立刻读可能读到旧值），本面板读写频繁，推荐改用 D1：
+
+1. Dashboard → Storage & Databases → D1 → Create，建一个数据库,名称随意，例如：**`tunnel-state`**；
+2. 点击控制台，在数据库执行框里运行以下命令：
+
+   ```sql
+   CREATE TABLE IF NOT EXISTS state (k TEXT PRIMARY KEY, v TEXT NOT NULL);
+   ```
+
+3. Worker → Settings → Bindings → D1 Database，变量名填 **`TUNNEL_DB`**；
+4. 重新部署。未绑定 D1 时自动回退到 KV（`TUNNEL_STATE`），行为不变；两者同时绑定则 D1 优先。
+
+数据自动互通：D1 和 KV 里存的是同样的键值（`meta:settings`、`tunnel:state:<账号>:<隧道>`、`chat:*`），从 KV 迁到 D1 时如需保留旧提醒配置，可在 D1 控制台执行 `INSERT OR REPLACE INTO state SELECT k, v FROM ...`（或重新在面板里保存一次 Telegram 配置即可，提醒开关重新打开一次）。
+
+## 多账号管理
+
+- 环境变量 `CF_API_TOKEN` + `CF_ACCOUNT_ID` 配置的账号永远存在，名为"默认账号"，不可删除。
+- 顶栏下拉选择账号，切换后隧道列表、域名、路由、提醒开关随账号切换；选择记忆在 KV，下次打开保持。
+- 点击右上角的**账号管理**：填名称、账户ID该账户的 API Token，**先验证再保存**（Token 只存 D1，不回显到页面）。
+- 提醒状态（上下线记录、20 秒防抖窗口）按账号隔离，互不串扰；Cron 定时检查会遍历**所有**账号。
+- 未绑定 KV 时多账号功能不可用（无法保存），回退为环境变量单账号。
+
+## Telegram 提醒配置
 
 1. 在 Telegram 找 [@BotFather](https://t.me/BotFather)，`/newbot` 创建机器人，拿到 **Bot Token**。
 2. **想让谁收提醒，就让谁先给机器人发一条消息（或 `/start`）**——机器人无法主动私聊从未互动过的用户。
@@ -65,17 +114,20 @@
 | `/api/list` | 隧道列表 + 在线状态 + 提醒状态（同时触发一次检查） |
 | `/api/create` `/api/update` `/api/delete` | 新建 / 编辑 / 删除隧道 |
 | `/api/token` | 获取隧道启动 Token（cloudflared 用） |
+| `/api/uptime` | 连接器运行时长（官方后台"运行时间"同源，用于在线徽章"在线 4d"） |
 | `/api/detail` `/api/route` | 查看 / 增删隧道 ingress 路由 |
 | `/api/alert` | 隧道提醒开关 (toggle) / 吞掉一次变化 (skip) |
 | `/api/tg` | Telegram 配置：保存、测试、增删接收者、暂停/恢复 |
+| `/api/acc` | 多账号：列表 (list) / 添加 (add, 先验证) / 删除 (del) / 切换 (switch) |
 
 ## 常见问题
 
-- **"KV 命名空间 TUNNEL_STATE"**：在 Worker → Settings → Bindings 里绑定 KV，变量名必须为 `TUNNEL_STATE`。
+- **"未绑定 KV 命名空间 TUNNEL_STATE"**：在 Worker → Settings → Bindings 里绑定 KV，变量名必须为 `TUNNEL_STATE`。
 - **"找不到该 chat_id"**：私聊接收者没给机器人发过 `/start`；或把机器人 ID/正数当成了群 ID 填写。个人填正数用户 ID，群组填负数 ID。
 - **"机器人 Token 无效"**：检查 Bot Token 是否复制完整、机器人是否被 BotFather 停用。
 - **"隧道仍有活跃连接,请先停止 cloudflared"**：删除前需先在目标机器上停止 `cloudflared` 进程（Cloudflare 平台限制）。
 - **"该域名已存在其他 DNS 记录"**：先到 Zone 的 DNS 页面删除冲突记录，或换个子域名。
+- **"DNS 记录清理失败"（删除隧道/路由后提示）**：检查 API Token 是否有**区域级 Zone → DNS → Edit** 权限（见「API Token 权限配置」），账户级的 Account DNS Settings 不能替代它；toast 里会显示具体原因。
 - **改密码后所有人掉线**：未设置 `SESSION_SECRET` 时会话密钥由密码派生；设置独立的 `SESSION_SECRET` 可避免。
 - **之前是"默认开提醒"的旧版本，现在想全部关**：新版已改为默认关，并带一次性迁移，打开面板后旧数据会自动清成关闭状态。
 
