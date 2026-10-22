@@ -1,28 +1,26 @@
 // Cloudflare Worker: Cloudflare Tunnel 管理面板
 // 环境变量 (Settings → Variables and Secrets):
-//   CF_API_TOKEN     API 令牌, 权限: Account → Cloudflare Tunnel → Edit
-//                                   Zone → DNS → Edit, Zone → Zone → Read
+//   CF_API_TOKEN     API 令牌, 权限: 权限: Argo Tunnel → Read & Edit；DNS → Read & Edit；Domains → Read & Edit
 //   CF_ACCOUNT_ID    账户 ID
 //   PASSWORD         登录密码 (必填), 至少 6 位
-//   SESSION_SECRET   会话签名密钥 (可选), 推荐设置一串随机字符
-//                    否则自动由 PASSWORD 派生 (改密码后所有人需重新登录)
+//   SESSION_SECRET   会话签名密钥 (可选), 推荐设置一串随机字符，否则自动由 PASSWORD 派生 (改密码后所有人需重新登录)
 //   DEFAULT_SERVICE  本地服务默认地址, 如 http://localhost:8001 (可选)
 //   TG_BOT_TOKEN     Telegram 机器人 Token (可选), 如 123456:ABC...
 //   TG_CHAT_ID       Telegram 接收提醒的 chat_id (可选), 群组为负数
 //
-// 访问方式: 打开 https://你的域名/ , 输入 PASSWORD 登录后进入管理面板。
+// 访问方式: 打开 https://你的域名 , 输入 PASSWORD 登录后进入管理面板。
 //
 // 提醒逻辑: 每次打开列表时比对隧道在线状态, 与上次相比发生变化才提醒 (上/下线各一次)
 // 首次记录不发提醒。比较的结果保存在 KV 中, 需要绑定 KV 命名空间:
 //   变量名 TUNNEL_STATE (Settings → Bindings → KV Namespace)
 // 未绑定 KV 时不会发送提醒。如需定时在后台检查 (即使没人打开面板), 可在
-// Triggers → Cron 中添加 *\/5 * * * * , 并在 Worker 入口加一个 scheduled 处理 (见代码末尾注释)。
+// Triggers → Cron 中添加 * /5 * * * * , 并在 Worker 入口加一个 scheduled 处理
 
 // ============================ 配置填写区 ============================
 // 推荐用 Dashboard → Settings → Secrets 配置。
 // 注意: KV 命名空间 TUNNEL_STATE 是运行时绑定,需在 Dashboard → Settings → Bindings → KV Namespace 绑定。
 const CONFIG_DEFAULTS = {
-  CF_API_TOKEN:    "", // [必填] API 令牌: Account→Cloudflare Tunnel→Edit; Zone→DNS→Edit; Zone→Zone→Read
+  CF_API_TOKEN:    "", // [必填] API 令牌: 权限: Argo Tunnel → Read & Edit；DNS → Read & Edit；Domains → Read & Edit
   CF_ACCOUNT_ID:   "", // [必填] Cloudflare 账户 ID, Workers 页面右侧可查
   PASSWORD:        "", // [必填] 面板登录密码, 至少 6 位
   SESSION_SECRET:  "", // [可选] 会话签名密钥, 填一串随机字符; 留空则自动由 PASSWORD 派生
@@ -1018,23 +1016,40 @@ const HTML = `<!doctype html>
 <meta name="mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <title>Cloudflare 隧道管理面板</title>
+<script>
+// 防闪白: 页面渲染前先把已保存的主题写到 html 根元素 (跟随系统 = 不设置 data-theme)
+(function(){try{
+  var t=localStorage.getItem('theme');
+  if(t==='light'||t==='dark')document.documentElement.setAttribute('data-theme',t);
+}catch(e){}})();
+</script>
 <style>
 :root{--bg:#f4f5f7;--card:#fff;--text:#1d2129;--sub:#7a828e;--line:#e3e6ea;--brand:#f6821f;--brand2:#ff9d4a;--ok:#22a06b;--bad:#d93f3f;--warn:#e8a317;--code:#16181d;--codet:#d7dae0;--side:#1b1e24;--side2:#2a2f38;--sideText:#c9cfd8;--in:#f4f5f7}
 @media(prefers-color-scheme:dark){:root{--bg:#0f1115;--card:#1a1d23;--text:#e8eaee;--sub:#8b93a0;--line:#2a2e36;--code:#0a0b0e;--codet:#c9ccd3;--side:#15181d;--side2:#262b33;--in:#12151a}}
+/* 手动主题: html[data-theme=light] 恒为亮色, [data-theme=dark] 恒为暗色; 未设置时跟随系统 */
+/* 侧栏不再恒为深色: 亮色=浅侧栏, 暗色=深侧栏, 切换时肉眼可见 */
+html[data-theme="light"]{--bg:#f4f5f7;--card:#fff;--text:#1d2129;--sub:#7a828e;--line:#e3e6ea;--code:#16181d;--codet:#d7dae0;--side:#eef0f4;--side2:#dfe3e9;--sideText:#3d4450;--in:#f4f5f7}
+html[data-theme="dark"]{--bg:#0f1115;--card:#1a1d23;--text:#e8eaee;--sub:#8b93a0;--line:#2a2e36;--code:#0a0b0e;--codet:#c9ccd3;--side:#15181d;--side2:#262b33;--sideText:#c9cfd8;--in:#12151a}
+html[data-theme="light"] body{background-image:radial-gradient(900px 480px at 18% -8%,rgba(246,130,31,.14),transparent 60%),radial-gradient(760px 420px at 88% 108%,rgba(246,130,31,.08),transparent 60%),linear-gradient(180deg,#f7f4ef 0%,#eef0f4 100%)}
+html[data-theme="dark"] body{background-image:none}
 *{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
 body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;background:var(--bg);color:var(--text);font-size:14px}
 .app{display:flex;height:100vh;height:100dvh;overflow:hidden}
 .sidenav{width:180px;flex:none;background:var(--side);color:var(--sideText);display:flex;flex-direction:column;padding:calc(env(safe-area-inset-top,0px) + 18px) 12px calc(env(safe-area-inset-bottom,0px) + 14px)}
-.sidenav .brand{display:flex;align-items:center;gap:9px;padding:2px 8px 18px;color:#fff;font-weight:700;font-size:15px}
+.sidenav .brand{display:flex;align-items:center;gap:9px;padding:2px 8px 18px;color:var(--text);font-weight:700;font-size:15px}
 .sidenav .brand .ic{width:30px;height:30px;border-radius:9px;background:linear-gradient(135deg,var(--brand),var(--brand2));display:flex;align-items:center;justify-content:center;font-size:16px}
 .nav{display:flex;flex-direction:column;gap:4px}
 .nav a{display:flex;align-items:center;gap:10px;padding:10px 12px;border-radius:10px;color:var(--sideText);text-decoration:none;font-size:14px;cursor:pointer;transition:background .15s}
 .nav a:hover{background:var(--side2)}
 .nav a.on{background:linear-gradient(135deg,var(--brand),var(--brand2));color:#fff;font-weight:600}
 .nav a .i{width:18px;text-align:center;font-size:15px}
-.sidenav .foot{margin-top:auto;font-size:11px;color:#7d8695}
-.sidenav .foot a{color:#9aa4b2;text-decoration:none;padding:8px;border-radius:8px;display:block}
-.sidenav .foot a:hover{background:var(--side2);color:#fff}
+.sidenav .foot{margin-top:auto;font-size:12.5px;color:var(--sub)}
+.sidenav .foot a{color:var(--sub);text-decoration:none;padding:8px;border-radius:8px;display:flex;align-items:center;gap:7px;transition:color .15s,background .15s}
+.sidenav .foot a .i{display:inline-block;font-size:14px}
+.sidenav .foot a .lo{margin-left:auto;font-size:14px;opacity:0;transform:translateX(-6px);transition:opacity .18s,transform .18s}
+.sidenav .foot a:hover{background:var(--side2);color:#e05252}
+.sidenav .foot a:hover .i{color:#e05252}
+.sidenav .foot a:hover .lo{opacity:1;transform:none}
 .main{flex:1;min-width:0;display:flex;flex-direction:column;overflow:hidden}
 .topbar{display:flex;align-items:center;gap:10px;padding:calc(env(safe-area-inset-top,0px) + 12px) 20px 12px;background:var(--card);border-bottom:1px solid var(--line);flex:none}
 .topbar h2{margin:0;font-size:16px;flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
@@ -1058,6 +1073,7 @@ background:var(--side2);color:var(--sub);font-size:12px;line-height:1;cursor:poi
 .preview b{color: #f8892b}
 .btn{display:inline-flex;align-items:center;justify-content:center;gap:6px;border:0;border-radius:10px;padding:11px 16px;font-size:14px;font-weight:600;cursor:pointer;color:#fff;background:linear-gradient(135deg,var(--brand),var(--brand2));white-space:nowrap}
 .btn.sm{padding:6px 11px;font-size:12.5px;font-weight:500;background:var(--in);background-image:none;color:var(--text);border:1px solid var(--line)}
+#theme{font-size:15px;line-height:1;padding:6px 10px}
 .btn.sm.red{color:var(--bad)}
 .btn.red-solid{background:#d93f3f;background-image:none}
 .btn.red-solid:hover{background:#e05252}
@@ -1168,7 +1184,7 @@ background:var(--side2);color:var(--sub);font-size:12px;line-height:1;cursor:poi
       <a data-v="tunnels"><span class="i">⚙️</span>Tunnel 管理</a>
       <a data-v="tg"><span class="i">✈️</span>Telegram 配置</a>
     </nav>
-    <div class="foot"><a href="#" id="logout">退出登录</a></div>
+    <div class="foot"><a href="#" id="logout"><span class="i">👤</span><span class="lt">退出登录</span><span class="lo">⇥</span></a></div>
   </aside>
 
   <div class="main">
@@ -1176,6 +1192,7 @@ background:var(--side2);color:var(--sub);font-size:12px;line-height:1;cursor:poi
       <button class="side-toggle" id="menu">☰</button>
       <h2 id="ttl">仪表板</h2>
       <button class="btn sm" id="refresh">刷新</button>
+      <button class="btn sm" id="theme" title="切换白天/黑夜主题">🌙</button>
     </div>
     <div class="content"><div class="wrap">
 
@@ -1512,7 +1529,12 @@ $('q').addEventListener('input',function(){
 $('qclear').onclick=function(){
   $('q').value='';$('q').parentNode.className='search';renderList();$('q').focus();
 };
-$('refresh').onclick=function(){loadList().then(loadMeta)};
+$('refresh').onclick=async function(){
+  var b=$('refresh');if(b.disabled)return;
+  b.disabled=true;b.innerHTML='<span class="spin"></span> 刷新中';
+  try{await loadList();await loadMeta();toast('列表已刷新')}catch(e){}
+  b.disabled=false;b.innerHTML='刷新';
+};
 async function loadList(){
   var l=$('list');
   try{
@@ -1841,6 +1863,25 @@ async function rmChat(chat){
   if(!(await askConfirm('移除接收者 '+chat+' ?','移除接收者','移除')))return;
   try{renderTg(await api('/api/tg',{action:'remove',chat:chat}));toast('已移除接收者')}catch(e){fail(e)}
 }
+
+/* ---- 主题切换 ---- */
+function applyTheme(t){
+  if(t==='light'||t==='dark')document.documentElement.setAttribute('data-theme',t);
+  else document.documentElement.removeAttribute('data-theme');
+  $('theme').textContent=(t==='dark')?'☀️':'🌙'; // 当前暗色→点一下变亮色(显示太阳)
+}
+function toggleTheme(){
+  // 未设置过时按当前实际渲染判定 (matchMedia), 切换后写入 localStorage
+  var cur=document.documentElement.getAttribute('data-theme')
+    ||(window.matchMedia&&matchMedia('(prefers-color-scheme: dark)').matches?'dark':'light');
+  var next=cur==='dark'?'light':'dark';
+  try{localStorage.setItem('theme',next)}catch(e){}
+  applyTheme(next);
+}
+$('theme').onclick=toggleTheme;
+var savedTheme='';
+try{savedTheme=localStorage.getItem('theme')||''}catch(e){}
+applyTheme(savedTheme);
 
 /* ---- 启动 ---- */
 show((location.hash||'').replace('#','')||'dash');
