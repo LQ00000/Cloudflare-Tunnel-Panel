@@ -24,8 +24,8 @@
 
 | 变量 | 必填 | 说明 |
 | --- | --- | --- |
-| `CF_API_TOKEN` | ✅ | API 令牌。权限：Account → Cloudflare Tunnel → **Edit**；Zone → DNS → **Edit**；Zone → Zone → **Read** |
-| `CF_ACCOUNT_ID` | ✅ | Cloudflare 账户 ID（Workers 页面右侧可见） |
+| `CF_ACCOUNT_ID` | ✅ | Cloudflare 账户 ID,创建token时会显示 |
+| `CF_API_TOKEN` | ✅ | API 令牌。权限：Account → Argo Tunnel → **Read & Edit**；Account DNS Settings → **Read & Edit**；DNS View → **Read & Edit**；Registrar Sandbox Domains → **Read & Admin** |
 | `PASSWORD` | ✅ | 面板登录密码，至少 6 位 |
 | `SESSION_SECRET` | 可选 | 会话签名密钥，一串随机字符。不设置时由密码派生（改密码会使所有人重新登录） |
 | `TUNNEL_STATE` | 可选 | **KV 命名空间绑定**（Bindings，不是环境变量），存储登录外的全部状态与提醒配置 |
