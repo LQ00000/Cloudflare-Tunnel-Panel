@@ -790,9 +790,11 @@ async function handleApi(request, env, path) {
       if (!/^[0-9a-f]{32}$/i.test(accId) || !token)
         return json({ error: "请填写 32 位账户 ID 和该账户的 API Token" }, 400);
       if (accountList(meta, env).some((a) => a.acc === accId)) return json({ error: "该账户 ID 已存在" }, 400);
-      // 先验证: 用新 Token 请求该账户, 通得过才保存
+      // 先验证: 直接用该 Token 请求此账户的隧道列表 (面板核心操作), 通得过才保存。
+      // 注意: /accounts/{id} (账户详情) 需要 "Account Settings Read" 这类账户级权限,
+      // 面板权限集里没有, 用它验证会误报权限不足; 隧道列表才是真实需要的能力。
       try {
-        await cf({ cfToken: token, CF_API_TOKEN: token }, `/accounts/${accId}`);
+        await cf({ cfToken: token, CF_API_TOKEN: token }, `/accounts/${accId}/cfd_tunnel?per_page=1`);
       } catch (e) {
         return json({ error: "账号验证失败: " + (e && e.message) }, 400);
       }
@@ -1165,7 +1167,7 @@ const HTML = `<!doctype html>
 @media(prefers-color-scheme:dark){:root{--bg:#0f1115;--card:#1a1d23;--text:#e8eaee;--sub:#8b93a0;--line:#2a2e36;--code:#0a0b0e;--codet:#c9ccd3;--side:#15181d;--side2:#262b33;--in:#12151a}}
 /* 手动主题: html[data-theme=light] 恒为亮色, [data-theme=dark] 恒为暗色; 未设置时跟随系统 */
 /* 侧栏不再恒为深色: 亮色=浅侧栏, 暗色=深侧栏, 切换时肉眼可见 */
-html[data-theme="light"]{--bg:#f4f5f7;--card:#fff;--text:#1d2129;--sub:#7a828e;--line:#e3e6ea;--code:#16181d;--codet:#d7dae0;--side:#eef0f4;--side2:#dfe3e9;--sideText:#3d4450;--in:#f4f5f7}
+html[data-theme="light"]{--bg:#f4f5f7;--card:#fff;--text:#1d2129;--sub:#7a828e;--line:#e3e6ea;--code:#0f5849;--codet:#d7dae0;--side:#eef0f4;--side2:#dfe3e9;--sideText:#3d4450;--in:#f4f5f7}
 html[data-theme="dark"]{--bg:#0f1115;--card:#1a1d23;--text:#e8eaee;--sub:#8b93a0;--line:#2a2e36;--code:#0a0b0e;--codet:#c9ccd3;--side:#15181d;--side2:#262b33;--sideText:#c9cfd8;--in:#12151a}
 html[data-theme="light"] body{background-image:radial-gradient(900px 480px at 18% -8%,rgba(246,130,31,.14),transparent 60%),radial-gradient(760px 420px at 88% 108%,rgba(246,130,31,.08),transparent 60%),linear-gradient(180deg,#f7f4ef 0%,#eef0f4 100%)}
 html[data-theme="dark"] body{background-image:none}
@@ -1194,13 +1196,14 @@ body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang 
 .topbar h2{margin:0;font-size:16px;position:absolute;left:50%;transform:translateX(-50%);max-width:40%;text-align:center;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .accwrap{display:flex;align-items:center;gap:9px;flex:none;margin-right:auto}
 .aclabel{font-size:13.5px;color:#f0932f;font-weight:700;white-space:nowrap}
+.amhint{color:var(--sub);font-weight:400}
 .accwrap select{width:auto;min-width:150px;max-width:280px;padding:6px 9px;font-size:13.5px;text-align:left;font-weight:600}
 .content{flex:1;overflow-y:auto;-webkit-overflow-scrolling:touch;padding:18px 20px calc(env(safe-area-inset-bottom,0px) + 40px)}
 .wrap{max-width:1400px;margin:0 auto}.view{display:none}.view.on{display:block}
 .card{background:var(--card);border-radius:14px;padding:16px;margin-bottom:14px;box-shadow:0 2px 12px rgba(0,0,0,.06);border:1px solid var(--line)}
 .card h3{margin:0 0 12px;font-size:15px;display:flex;justify-content:space-between;align-items:center;gap:10px}
 label{display:block;font-size:12px;color:var(--sub);margin:12px 0 5px}
-input,select{width:100%;padding:11px;font-size:15px;color:var(--text);background:var(--in);border:1px solid var(--line);border-radius:10px;outline:none;transition:border .15s;font-family:inherit}
+input,select{width:100%;padding:11px;font-size:15px;color:var(--text);background:var(--in);border:1px solid var(--line);border-radius:8px;outline:none;transition:border .15s;font-family:inherit}
 input:focus,select:focus{border-color:var(--brand)}
 .row{display:flex;gap:8px}.row .sub{flex:1;min-width:0}.row .zone{flex:1.3;min-width:0}
 .toolbar{display:flex;gap:10px;align-items:center;margin-bottom:14px}
@@ -1312,9 +1315,24 @@ background:var(--side2);color:var(--sub);font-size:12px;line-height:1;cursor:poi
   .sidenav{position:fixed;left:0;top:0;bottom:0;z-index:20;transform:translateX(-100%);transition:transform .2s}
   .sidenav.open{transform:none;box-shadow:0 0 40px rgba(0,0,0,.4)}
   .content{padding:14px 12px calc(env(safe-area-inset-bottom,0px) + 40px)}
-  .topbar{padding:calc(env(safe-area-inset-top,0px) + 10px) 12px 10px}
+  .topbar{padding:calc(env(safe-area-inset-top,0px) + 10px) 10px 10px;gap:7px;flex-wrap:nowrap}
+  /* 手机: 缩小字号, 下拉变窄, 标题不与账号组重叠, 主题按钮可见 */
+  .topbar h2{position:static;transform:none;left:auto;max-width:none;font-size:13px;flex:1;min-width:0;order:2;text-align:right;padding-right:2px}
+  .accwrap{order:1;flex:none;min-width:0;gap:5px}
+  .aclabel{font-size:11.5px}
+  .accwrap select{min-width:0;max-width:96px;width:auto;padding:5px 6px;font-size:12px}
+  .btn.sm{padding:5px 8px;font-size:11.5px}
+  .btn.sm#theme{padding:5px 7px;font-size:14px;flex:none}
+  .btn.sm#acc_mgr{flex:none;font-size:13px;padding:4px 7px}
   .stat .v{font-size:26px}
   .modal{left:0;top:auto;bottom:0;transform:none;width:100%;max-height:92vh;border-radius:18px 18px 0 0;border-bottom:0;padding-bottom:calc(env(safe-area-inset-bottom,0px) + 20px)}
+  /* 手机: 确认弹窗 (.modal.confirm 的 top/transform 优先级更高, 需单独覆盖), 否则会左偏出屏 */
+  /* bottom:0 → 悬浮在底部上方 (避开手机浏览器底部工具栏), 不再贴死屏幕底缘 */
+  .modal.confirm{top:auto;transform:none;width:100%;bottom:calc(env(safe-area-inset-bottom,0px) + 56px);border-radius:16px 16px 0 0}
+  /* 手机: 账号管理弹窗的两个输入框上下堆叠, 不再并排错位 */
+  .amrow{flex-direction:column;gap:0}
+  .amrow > div{flex:none !important;width:100%}
+  .amhint{display:block;margin-top:2px}
   .toolbar{gap:8px}
 }
 </style></head><body>
@@ -1465,8 +1483,8 @@ background:var(--side2);color:var(--sub);font-size:12px;line-height:1;cursor:poi
   <h3><span>账号管理</span><button class="x" id="am_x">✕</button></h3>
   <div id="am_body"></div>
   <div style="border-top:1px solid var(--line);margin-top:14px;padding-top:14px">
-    <div class="row">
-      <div style="flex:1;min-width:0"><label>账号名称 (邮箱/中英文/数字, 不能全是标点)</label><input id="am_name" placeholder="例如 admin@x.com / 主账号 / VPS商2" autocomplete="off"></div>
+    <div class="row amrow">
+      <div style="flex:1;min-width:0"><label>账号名称 <span class="amhint">(邮箱/中英文/数字)</span></label><input id="am_name" placeholder="例如 admin@x.com / 主账号" autocomplete="off"></div>
       <div style="flex:1.2;min-width:0"><label>账户 ID (32 位)</label><input id="am_acc" placeholder="Cloudflare 账户 ID" autocapitalize="off" autocomplete="off" spellcheck="false"></div>
     </div>
     <label>该账户的 API Token (权限同环境变量要求)</label>
@@ -1693,7 +1711,20 @@ document.addEventListener('click',async function(e){
         (a.builtin?'':'<button class="btn sm red" data-amdel="'+esc(a.acc)+'">删除</button>')+
         '</div>';
     }).join('')||'<div class="empty">暂无添加的账号</div>';
-    renderAccSel({accounts:items,cur:curAcc});
+    // 删除的是当前账号 (或其已不存在) → 自动切回默认账号 (env 账号), 重新加载列表/域名/提醒
+    if(curAcc===t.dataset.amdel||!items.some(function(a){return a.acc===curAcc})){
+      var fallback=items.find(function(a){return a.builtin})||items[0];
+      if(fallback){
+        curAcc=fallback.acc;
+        try{await api('/api/acc',{action:'switch',acc:curAcc})}catch(e2){}
+        renderAccSel({accounts:items,cur:curAcc});
+        setBusy(true,'账号切换中...');
+        try{metaCache={};await Promise.all([loadList(),initZones()])}finally{setBusy(false)}
+        loadTg();loadMeta();
+      }
+    }else{
+      renderAccSel({accounts:items,cur:curAcc});
+    }
   }catch(e){fail(e)}
 });
 function show(v){
@@ -2156,7 +2187,7 @@ if('serviceWorker' in navigator)navigator.serviceWorker.register('/sw.js',{scope
 </script></body></html>`;
 
 
-// 定时检查 (可选): Worker → Triggers → Cron 添加 */5 * * * * 即可在后台持续检查并提醒。
+// 定时检查 (可选): 添加 */5 * * * * 即可在后台持续检查并提醒。
 export const scheduled = async (event, env, ctx) => {
   env = applyConfig(env); // 顶部"配置填写区"优先
   if (!store(env)) return;
