@@ -27,7 +27,7 @@ Cloudflare Worker部署的Argo tunnel网页管理面板，用于管理多账户�
 | 变量 | 必填 | 说明 |
 | --- | --- | --- |
 | `CF_API_TOKEN` | ✅ | API 令牌。权限见下方「API Token 权限配置」 |
-| `CF_ACCOUNT_ID` | ✅ | Cloudflare 账户 ID（Workers 页面右侧可见） |
+| `CF_ACCOUNT_ID` | ✅ | Cloudflare 账户 ID,创建token时会显示 |
 | `PASSWORD` | ✅ | 面板登录密码，至少 6 位 |
 | `SESSION_SECRET` | 建议 | 会话签名密钥，一串随机字符。不设置时由密码派生（改密码会使所有人重新登录） |
 | `TUNNEL_STATE` | 可选 | **KV 命名空间绑定**（Bindings，不是环境变量），存储登录外的全部状态与提醒配置。**推荐改用 D1**：绑定变量名 `TUNNEL_DB`（建表见下），两者同时绑定时 D1 优先 |
