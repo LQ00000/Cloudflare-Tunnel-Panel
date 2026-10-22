@@ -17,9 +17,9 @@ Cloudflare Worker部署的Argo tunnel网页管理面板，用于管理多账户�
 ## 快速部署（Cloudflare Dashboard）
 
 1. 登录 [Cloudflare Dashboard](https://dash.cloudflare.com) → **Workers & Pages** → **Create** → 创建 Worker，把 `_worker.js` 内容全部粘贴进去，保存。
-2. **【必须】绑定 KV 命名空间**：Worker → Settings → Bindings → Add → KV Namespace，变量名填 `TUNNEL_STATE`（没有它无法保存提醒配置、接收者等信息）。
+2. **【非必须】绑定 D1数据库管理多账号**：参考下方D1数据库的设置
 3. **【必须】配置环境变量**：Settings → Variables and Secrets，添加 `CF_API_TOKEN`、`CF_ACCOUNT_ID`、`PASSWORD`（详见下表）。
-4. 部署后打开 `https://<Worker 域名>/`，输入密码登录即可。
+4. 部署后打开 `https://<Worker 域名>`，输入密码登录即可。
 
 
 ## 环境变量
