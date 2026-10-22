@@ -178,7 +178,8 @@ async function getRules(env, base, id) {
 }
 
 async function createTunnel(env, { name, zoneId, sub, path, service }) {
-  const acc = env.CF_ACCOUNT_ID;
+  // 多账号: 用当前所选账号 (cfAcc/cfToken 由 handleApi 注入), 而不是环境变量的默认账号
+  const acc = env.cfAcc || env.CF_ACCOUNT_ID;
   const zone = await cf(env, `/zones/${zoneId}`);
   const hostname = sub ? `${sub}.${zone.name}` : zone.name;
   await checkHost(env, zoneId, hostname, ""); // 先查 DNS, 有冲突就不建隧道, 避免留下孤儿隧道
@@ -2187,7 +2188,7 @@ if('serviceWorker' in navigator)navigator.serviceWorker.register('/sw.js',{scope
 </script></body></html>`;
 
 
-// 定时检查 (可选): 添加 */5 * * * * 即可在后台持续检查并提醒。
+// 定时检查 (可选): Worker → Triggers → Cron 添加 */5 * * * * 即可在后台持续检查并提醒。
 export const scheduled = async (event, env, ctx) => {
   env = applyConfig(env); // 顶部"配置填写区"优先
   if (!store(env)) return;
