@@ -1072,6 +1072,20 @@ async function handleApi(request, env, path) {
 }
 
 export default {
+  // Cron 定时检查: 必须作为 default 导出的属性, Cloudflare 才会调用 (独立具名导出无效)
+  async scheduled(event, env, ctx) {
+    env = applyConfig(env); // 顶部"配置填写区"优先
+    if (!store(env)) return;
+    // Cron 检查遍历所有账号 (env 默认账号 + 面板添加的账号), 各自独立提醒
+    const meta = await getMeta(env);
+    for (const a of accountList(meta, env)) {
+      try {
+        await runChecks({ ...env, cfToken: a.token || env.CF_API_TOKEN, cfAcc: a.acc },
+          await listTunnels({ ...env, cfToken: a.token || env.CF_API_TOKEN, cfAcc: a.acc },
+            `/accounts/${a.acc}/cfd_tunnel`));
+      } catch (e) {}
+    }
+  },
   async fetch(request, env) {
     env = applyConfig(env); // 顶部"配置填写区"优先
     if (!env.PASSWORD) return new Response("请先配置环境变量 PASSWORD", { status: 500 });
@@ -2253,19 +2267,3 @@ initZones().catch(function(){}).then(loadAccs).then(function(){
 });
 if('serviceWorker' in navigator)navigator.serviceWorker.register('/sw.js',{scope:'/'}).catch(function(){});
 </script></body></html>`;
-
-
-// 定时检查 (可选): Worker → 添加cron触发器 */5 * * * * 即可在后台持续检查并提醒。
-export const scheduled = async (event, env, ctx) => {
-  env = applyConfig(env); // 顶部"配置填写区"优先
-  if (!store(env)) return;
-  // Cron 检查遍历所有账号 (env 默认账号 + 面板添加的账号), 各自独立提醒
-  const meta = await getMeta(env);
-  for (const a of accountList(meta, env)) {
-    try {
-      await runChecks({ ...env, cfToken: a.token || env.CF_API_TOKEN, cfAcc: a.acc },
-        await listTunnels({ ...env, cfToken: a.token || env.CF_API_TOKEN, cfAcc: a.acc },
-          `/accounts/${a.acc}/cfd_tunnel`));
-    } catch (e) {}
-  }
-};
