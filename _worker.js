@@ -29,7 +29,7 @@ const CONFIG_DEFAULTS = {
   CF_API_TOKEN:    "", // [必填] API 令牌, 权限参考上述说明
   CF_ACCOUNT_ID:   "", // [必填] Cloudflare 账户 ID,创建token时会提示
   PASSWORD:        "", // [必填] 面板登录密码, 至少 6 位
-  SESSION_SECRET:  "XuWj9JxxhlHTXhcT8cF4761451F4491e93BcD629039c4", // [可选] 会话签名密钥, 填一串随机字符; 留空则自动由 PASSWORD 派生
+  SESSION_SECRET:  "", // [可选] 会话签名密钥, 填一串随机字符; 留空则自动由 PASSWORD 派生
   DEFAULT_SERVICE: "http://localhost:8001", // [可选] 新建/编辑隧道的默认本地服务地址, 默认 http://localhost:8001
   TG_BOT_TOKEN:    "", // [可选] Telegram 机器人 Token; 也可在面板"Telegram 配置"里保存到 KV
   TG_CHAT_ID:      "", // [可选] Telegram 接收者 chat_id: 私聊填自己的正数 ID, 群组填负数
@@ -803,6 +803,44 @@ async function handleApi(request, env, path) {
       await saveMeta(env, meta);
       return json({ ok: true, accounts: accountList(meta, env).map((a) => ({ name: a.name, acc: a.acc, builtin: !!a.builtin })) });
     }
+    if (action === "edit") {
+      requireKv(env);
+      const accId = str(d.acc);
+      const row = meta.accounts.find((a) => str(a.acc) === accId);
+      if (!row) return json({ error: "账号不存在或为环境变量默认账号 (不可编辑)" }, 400);
+      const newName = str(d.name).trim().slice(0, 64);
+      const newAcc = str(d.newAcc);
+      const newToken = str(d.token);
+      // 名称: 填了就校验并更新; 留空保持原值
+      if (newName) {
+        if (!/[\p{L}\p{N}]/u.test(newName))
+          return json({ error: "账号名称需至少包含一个文字或数字 (不能全是标点符号)" }, 400);
+        row.name = newName;
+      }
+      // 账户 ID: 填了才改, 且不能与其他账号重复
+      if (newAcc) {
+        if (!/^[0-9a-f]{32}$/i.test(newAcc)) return json({ error: "账户 ID 需为 32 位十六进制" }, 400);
+        if (accountList(meta, env).some((a) => a.acc === newAcc && a.acc !== accId))
+          return json({ error: "该账户 ID 已存在" }, 400);
+      }
+      // Token: 填了才轮换; ID 或 Token 任一变更都要用(新)凭据验证
+      if (newAcc || newToken) {
+        const testAcc = newAcc || accId;
+        const testToken = newToken || row.token;
+        try {
+          await cf({ cfToken: testToken, CF_API_TOKEN: testToken }, `/accounts/${testAcc}/cfd_tunnel?per_page=1`);
+        } catch (e) {
+          return json({ error: "账号验证失败: " + (e && e.message) }, 400);
+        }
+        if (newToken) row.token = newToken;
+        if (newAcc) {
+          row.acc = newAcc;
+          if (meta.curAcc === accId) meta.curAcc = newAcc;
+        }
+      }
+      await saveMeta(env, meta);
+      return json({ ok: true, accounts: accountList(meta, env).map((a) => ({ name: a.name, acc: a.acc, builtin: !!a.builtin })) });
+    }
     if (action === "del") {
       requireKv(env);
       const accId = str(d.acc);
@@ -836,7 +874,7 @@ async function handleApi(request, env, path) {
       await createTunnel(env, {
         name,
         zoneId: str(d.zoneId),
-        sub: str(d.sub).replace(/.$/, ""),
+        sub: str(d.sub).replace(/\.$/, ""),
         path: str(d.path),
         service,
       })
@@ -884,7 +922,7 @@ async function handleApi(request, env, path) {
       const service = str(d.service);
       if (!d.zoneId || !service) return json({ error: "请选择域名并填写本地服务地址" }, 400);
       if (svcErr(service)) return json({ error: svcErr(service) }, 400);
-      const sub = str(d.sub).replace(/.$/, "");
+      const sub = str(d.sub).replace(/\.$/, "");
       const p = str(d.path);
       const zone = await cf(env, `/zones/${d.zoneId}`);
       const hostname = sub ? `${sub}.${zone.name}` : zone.name;
@@ -964,7 +1002,7 @@ async function handleApi(request, env, path) {
     const service = str(d.service);
     if (!d.zoneId || !service) return json({ error: "请填写本地服务地址" }, 400);
     if (svcErr(service)) return json({ error: svcErr(service) }, 400);
-    const sub = str(d.sub).replace(/.$/, "");
+    const sub = str(d.sub).replace(/\.$/, "");
     const p = str(d.path);
     const zone = await cf(env, `/zones/${d.zoneId}`);
     const hostname = sub ? `${sub}.${zone.name}` : zone.name;
@@ -1191,6 +1229,7 @@ body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang 
 .sidenav .foot a:hover .i{color:#e05252}
 .sidenav .foot a:hover .lo{opacity:1;transform:none}
 .am-item{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:9px 11px;border:1px solid var(--line);border-radius:10px;margin-bottom:8px;background:var(--in)}
+.am-edit{border:1px dashed var(--line);border-radius:10px;padding:10px 11px;margin:-4px 0 10px;background:var(--in)}
 .main{flex:1;min-width:0;display:flex;flex-direction:column;overflow:hidden}
 .topbar{display:flex;align-items:center;gap:10px;padding:calc(env(safe-area-inset-top,0px) + 12px) 20px 12px;background:var(--card);border-bottom:1px solid var(--line);flex:none;position:relative}
 /* 标题绝对定位居中于整条顶栏(不参与 flex 布局); 账号组 margin-right:auto 贴左 */
@@ -1664,18 +1703,59 @@ $('acc_sel').addEventListener('change',async function(){
   loadMeta();
 });
 $('acc_mgr').onclick=function(){openAccMgr()};
+// 账号管理弹窗列表渲染 (含编辑按钮); items: [{name,acc,builtin}]
+function amRender(items){
+  accNames={};
+  $('am_body').innerHTML=items.map(function(a){
+    accNames[a.acc]=a.name;
+    return '<div class="am-item"><div style="min-width:0"><b>'+esc(a.name)+'</b>'+
+      '<div style="font-size:11px;color:var(--sub)">'+esc(a.acc)+(a.builtin?' · 环境变量配置':'')+'</div></div>'+
+      (a.builtin?'':'<div style="display:flex;gap:6px;flex:none">'+
+        '<button class="btn sm" data-amedit="'+esc(a.acc)+'" data-amname="'+esc(a.name)+'">编辑</button>'+
+        '<button class="btn sm red" data-amdel="'+esc(a.acc)+'">删除</button></div>')+
+      '</div>';
+  }).join('')||'<div class="empty">暂无添加的账号</div>';
+}
+// 点"编辑"在该账号卡片下展开内联编辑表单; 留空的字段保持原值不变
+document.addEventListener('click',function(e){
+  var t=e.target.closest('[data-amedit]');if(!t)return;
+  document.querySelectorAll('.am-edit').forEach(function(x){x.remove()}); // 同时只展开一个
+  var acc=t.dataset.amedit,orig=t.dataset.amname;
+  var div=document.createElement('div');
+  div.className='am-edit';
+  div.innerHTML=
+    '<label style="margin-top:10px">账号名称 (留空保持不变)</label>'+
+    '<input id="ame_name" placeholder="当前: '+esc(orig)+'" autocomplete="off">'+
+    '<label>账户 ID (留空保持不变)</label>'+
+    '<input id="ame_acc" placeholder="当前: '+esc(acc)+'" autocapitalize="off" autocomplete="off" spellcheck="false">'+
+    '<label>API Token (留空保持不变; 换新 Token 会先验证)</label>'+
+    '<input id="ame_token" placeholder="粘贴新 Token" autocapitalize="off" autocomplete="off" spellcheck="false">'+
+    '<div style="display:flex;gap:8px;margin-top:10px">'+
+      '<button class="btn gray" id="ame_cancel" style="flex:1">取消</button>'+
+      '<button class="btn" id="ame_save" style="flex:1">保存</button>'+
+    '</div>';
+  t.closest('.am-item').after(div);
+  $('ame_cancel').onclick=function(){div.remove()};
+  $('ame_save').onclick=async function(){
+    var sb=this;
+    sb.disabled=true;sb.innerHTML='<span class="spin"></span> 保存中';
+    try{
+      var d=await api('/api/acc',{action:'edit',acc:acc,
+        name:$('ame_name').value.trim(),newAcc:$('ame_acc').value.trim(),token:$('ame_token').value.trim()});
+      toast('账号已更新');
+      amRender(d.accounts||[]);
+      renderAccSel({accounts:d.accounts||[],cur:curAcc});
+    }catch(e){fail(e)}
+    sb.disabled=false;sb.innerHTML='保存';
+  };
+});
 async function openAccMgr(){
   var b=$('am_body');
   b.innerHTML='<div class="empty">加载中...</div>';
   openModal('mAccMgr');
   try{
     var d=await api('/api/acc',{action:'list'});
-    b.innerHTML=(d.accounts||[]).map(function(a){
-      return '<div class="am-item"><div style="min-width:0"><b>'+esc(a.name)+'</b>'+
-        '<div style="font-size:11px;color:var(--sub)">'+esc(a.acc)+(a.builtin?' · 环境变量配置':'')+'</div></div>'+
-        (a.builtin?'':'<button class="btn sm red" data-amdel="'+esc(a.acc)+'">删除</button>')+
-        '</div>';
-    }).join('')||'<div class="empty">暂无添加的账号</div>';
+    amRender(d.accounts||[]);
   }catch(e){b.innerHTML='<div class="empty">加载失败</div>';fail(e)}
 }
 $('am_add').onclick=async function(){
@@ -1686,15 +1766,8 @@ $('am_add').onclick=async function(){
     var d=await api('/api/acc',{action:'add',name:name,acc:acc,token:token});
     $('am_name').value='';$('am_acc').value='';$('am_token').value='';
     toast('账号已添加: '+name);
-    var items=d.accounts||[];accNames={};
-    $('am_body').innerHTML=items.map(function(a){
-      accNames[a.acc]=a.name;
-      return '<div class="am-item"><div style="min-width:0"><b>'+esc(a.name)+'</b>'+
-        '<div style="font-size:11px;color:var(--sub)">'+esc(a.acc)+(a.builtin?' · 环境变量配置':'')+'</div></div>'+
-        (a.builtin?'':'<button class="btn sm red" data-amdel="'+esc(a.acc)+'">删除</button>')+
-        '</div>';
-    }).join('');
-    renderAccSel({accounts:items,cur:curAcc});
+    amRender(d.accounts||[]);
+    renderAccSel({accounts:d.accounts||[],cur:curAcc});
   }catch(e){fail(e)}
   b.disabled=false;b.innerHTML='添加账号';
 };
@@ -1704,14 +1777,8 @@ document.addEventListener('click',async function(e){
   try{
     var d=await api('/api/acc',{action:'del',acc:t.dataset.amdel});
     toast('已删除');
-    var items=d.accounts||[];accNames={};
-    $('am_body').innerHTML=items.map(function(a){
-      accNames[a.acc]=a.name;
-      return '<div class="am-item"><div style="min-width:0"><b>'+esc(a.name)+'</b>'+
-        '<div style="font-size:11px;color:var(--sub)">'+esc(a.acc)+(a.builtin?' · 环境变量配置':'')+'</div></div>'+
-        (a.builtin?'':'<button class="btn sm red" data-amdel="'+esc(a.acc)+'">删除</button>')+
-        '</div>';
-    }).join('')||'<div class="empty">暂无添加的账号</div>';
+    var items=d.accounts||[];
+    amRender(items);
     // 删除的是当前账号 (或其已不存在) → 自动切回默认账号 (env 账号), 重新加载列表/域名/提醒
     if(curAcc===t.dataset.amdel||!items.some(function(a){return a.acc===curAcc})){
       var fallback=items.find(function(a){return a.builtin})||items[0];
@@ -1885,7 +1952,7 @@ async function toggleAlert(id,on,up){
 /* ---- 新建隧道 ---- */
 function zoneName(){var o=$('zone').options[$('zone').selectedIndex];return o?o.textContent:''}
 function preview(){
-  var sub=$('sub').value.trim().replace(/\.$/,''),z=zoneName().replace(/^\./,''),p=$('path').value.trim(),s=$('svc').value.trim();
+  var sub=$('sub').value.trim(),z=zoneName().replace(/^\./,''),p=$('path').value.trim(),s=$('svc').value.trim();
   if(!z){$('pv').innerHTML='';return}
   var host=sub?sub+'.'+z:z;
   $('pv').innerHTML='<b>'+esc(host)+'</b>'+(p?' · 路径 '+esc(p):'')+' → '+esc(s||'(未填写本地服务)');
@@ -1978,7 +2045,7 @@ function fillEditRule(i){
   ePreview();
 }
 function ePreview(){
-  var sub=$('e_sub').value.trim().replace(/\.$/,''),o=$('e_zone').options[$('e_zone').selectedIndex],
+  var sub=$('e_sub').value.trim(),o=$('e_zone').options[$('e_zone').selectedIndex],
       z=o?o.textContent.charAt(0)==='.'?o.textContent.slice(1):'':'',p=$('e_path').value.trim(),s=$('e_svc').value.trim();
   if(!z){$('e_pv').innerHTML='';return}
   $('e_pv').innerHTML='<b>'+esc(sub?sub+'.'+z:z)+'</b>'+(p?' · 路径 '+esc(p):'')+' → '+esc(s||'(未填写本地服务)');
@@ -2048,7 +2115,7 @@ function renderRoutes(rules){
   }).join('');
 }
 function rPreview(){
-  var sub=$('r_sub').value.trim().replace(/\.$/,''),o=$('r_zone').options[$('r_zone').selectedIndex],
+  var sub=$('r_sub').value.trim(),o=$('r_zone').options[$('r_zone').selectedIndex],
       z=o?o.textContent.charAt(0)==='.'?o.textContent.slice(1):'':'',p=$('r_path').value.trim(),s=$('r_svc').value.trim();
   if(!z){$('r_pv').innerHTML='';return}
   $('r_pv').innerHTML='<b>'+esc(sub?sub+'.'+z:z)+'</b>'+(p?' · 路径 '+esc(p):'')+' → '+esc(s||'(未填写本地服务)');
@@ -2188,7 +2255,7 @@ if('serviceWorker' in navigator)navigator.serviceWorker.register('/sw.js',{scope
 </script></body></html>`;
 
 
-// 定时检查 (可选): Worker → Triggers → Cron 添加 */5 * * * * 即可在后台持续检查并提醒。
+// 定时检查 (可选): Worker → 添加cron触发器 */5 * * * * 即可在后台持续检查并提醒。
 export const scheduled = async (event, env, ctx) => {
   env = applyConfig(env); // 顶部"配置填写区"优先
   if (!store(env)) return;
